@@ -1,0 +1,15 @@
+{
+  "task_id": "example-task-id",
+  "created": "2026-01-01T00:00:00Z",
+  "state": "SHAPE",
+  "phase_status": {
+    "SHAPE": "PROCESSING"
+  },
+  "draft_rounds": 0,
+  "verify_reengage": 0,
+  "operator_approvals": [],
+  "escalations": [],
+  "last_completed_step": null,
+  "awaiting_operator": false,
+  "state_reason": "task created"
+}

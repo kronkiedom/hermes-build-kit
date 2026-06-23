@@ -1,0 +1,10 @@
+{
+  "enabled": false,
+  "phase": "bootstrap",
+  "eligibility_kinds": ["docs-only"],
+  "gate_approval": "operator-defined",
+  "gate2_push_target": "operator-defined",
+  "max_tasks_per_day": null,
+  "gate_timeout": "hold",
+  "note": "demo target for starter script verification"
+}

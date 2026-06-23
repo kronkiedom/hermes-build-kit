@@ -1,0 +1,13 @@
+{
+  "task_id": "sample-task",
+  "created": "2026-01-01T00:00:00Z",
+  "state": "CONTRACT-CHECKPOINT",
+  "phase_status": {
+    "SHAPE": "COMPLETED",
+    "CONTRACT-CHECKPOINT": "PROCESSING"
+  },
+  "operator_approvals": [],
+  "escalations": [],
+  "awaiting_operator": true,
+  "state_reason": "awaiting operator approval of written contract"
+}

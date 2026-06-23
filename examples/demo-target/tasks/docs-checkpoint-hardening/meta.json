@@ -1,0 +1,19 @@
+{
+  "task_id": "docs-checkpoint-hardening",
+  "created": "2026-06-23T20:44:01.134317+00:00",
+  "state": "SHAPE",
+  "phase_status": {
+    "SHAPE": "PROCESSING"
+  },
+  "operator_approvals": [
+    {
+      "phase": "PREP-ADMISSION",
+      "outcome": "APPROVE",
+      "timestamp": "2026-06-23T20:44:01.134327+00:00",
+      "source": "/workspace/hermes-build-kit/examples/demo-target/.auto-prep/ack.json"
+    }
+  ],
+  "escalations": [],
+  "awaiting_operator": false,
+  "state_reason": "created from prepared candidate acknowledgement"
+}

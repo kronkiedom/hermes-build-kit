@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local runtime outputs for demo/verification targets
+examples/demo-target/.automation/status/
+examples/demo-target/.auto-prep/
+
+# Misc
+*.log
