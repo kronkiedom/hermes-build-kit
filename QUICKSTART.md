@@ -22,6 +22,22 @@ This repository is meant to be read by a fresh Hermes environment and then adapt
 - `prompts/04-create-cron-workers.md`
 - `prompts/05-verify-automation.md`
 
+## If you are hand-driving another Hermes environment
+Use the operator-facing prompt files instead of improvising your own message.
+
+Sequence:
+- `prompts/operator-message-01.md`
+- `prompts/operator-message-02.md`
+- `prompts/operator-message-03.md`
+- `prompts/operator-message-04.md`
+- `prompts/operator-message-05.md`
+
+For each message:
+1. replace `<BOOTSTRAP_REPO_PATH>` with the path to this repo in that environment,
+2. replace `<TARGET_REPO_PATH>` with the target repo path,
+3. send exactly one operator message,
+4. wait for real verification output before sending the next one.
+
 ## Adaptation rule
 This kit defines invariants, not one mandatory folder layout. The target environment should preserve the process contract while adapting path names and repo-specific verification commands.
 

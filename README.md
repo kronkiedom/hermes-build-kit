@@ -41,3 +41,20 @@ It is intentionally **project-generic**. It defines invariants and templates, th
 - Prompt 3: add automation helpers
 - Prompt 4: create cron workers
 - Prompt 5: verify end-to-end behavior
+
+## Operator-message workflow
+If you are driving a separate Hermes environment by hand, use the operator-facing prompt files in `prompts/`.
+
+Recommended order:
+- `prompts/operator-message-01.md`
+- `prompts/operator-message-02.md`
+- `prompts/operator-message-03.md`
+- `prompts/operator-message-04.md`
+- `prompts/operator-message-05.md`
+
+How to use them:
+1. Replace `<BOOTSTRAP_REPO_PATH>` with the path to this repo in the fresh environment.
+2. Replace `<TARGET_REPO_PATH>` with the path to the repo where the pipeline should be installed.
+3. Send only one operator-message file at a time.
+4. Wait for verification before sending the next one.
+5. Stop after any failed verification and remediate before advancing.
