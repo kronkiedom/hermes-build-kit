@@ -16,9 +16,10 @@ It is intentionally **project-generic**. It defines invariants and templates, th
 - `docs/pipeline.md` — canonical lifecycle, gates, invariants, and artifact contract
 - `docs/automation-architecture.md` — portable automation model and worker boundaries
 - `docs/operator-runbook.md` — how a human operator interacts with the system
+- `docs/discord-plan-automation.md` — Discord build-control intake and plan-to-PR MVP
 - `docs/adaptation-guide.md` — what must be customized per target repo
 - `prompts/` — stepwise prompts for a fresh Hermes environment
-- `templates/` — starter JSON/Markdown artifacts
+- `templates/discord-routing.example.json` — sample local Discord routing config for plan intake
 - `scripts/` — optional starter utilities for status collection and dashboards
 - `examples/` — sample task/backlog layouts
 

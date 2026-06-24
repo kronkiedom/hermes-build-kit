@@ -46,6 +46,13 @@ def main():
 
     active_tasks = collect_active_tasks(tasks_root)
     backlog_candidates = sorted(p.name for p in backlog_root.glob("candidate-*.md")) if backlog_root.exists() else []
+    plans_index_raw = load_json(automation_root / "plans-index.json", {"plans": {}})
+    plans = plans_index_raw.get("plans", {}) if isinstance(plans_index_raw, dict) else {}
+    active_plans = [
+        plan for plan in plans.values()
+        if isinstance(plan, dict) and plan.get("state") not in {"DONE", "CANCELLED"}
+    ]
+    routing = load_json(automation_root / "discord-routing.json", {})
     autonomy = load_json(automation_root / "AUTONOMY.json", {})
 
     dashboard = {
@@ -53,7 +60,10 @@ def main():
         "repo_root": str(repo_root),
         "active_task_count": len(active_tasks),
         "active_tasks": active_tasks,
+        "active_plan_count": len(active_plans),
+        "active_plans": active_plans,
         "backlog_candidate_count": len(backlog_candidates),
+        "discord_routing": routing,
         "autonomy": autonomy,
     }
 
@@ -72,8 +82,24 @@ def main():
         md_lines.append("- none")
     md_lines.extend([
         "",
+        "## Plans",
+    ])
+    if active_plans:
+        for plan in active_plans:
+            md_lines.append(
+                f"- `{plan.get('plan_id')}` — state `{plan.get('state')}`, "
+                f"thread `{plan.get('thread_id')}`"
+            )
+    else:
+        md_lines.append("- none")
+    md_lines.extend([
+        "",
         "## Backlog",
         f"- candidate_count: `{len(backlog_candidates)}`",
+        "",
+        "## Discord routing",
+        f"- build_control_channel_id: `{routing.get('build_control_channel_id')}`",
+        f"- general_channel_id: `{routing.get('general_channel_id')}`",
         "",
         "## Autonomy",
         f"- enabled: `{autonomy.get('enabled')}`",

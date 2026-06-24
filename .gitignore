@@ -24,7 +24,10 @@ examples/demo-target/tasks/docs-checkpoint-hardening/
 # --- live pipeline instance runtime outputs (root self-install; not committed) ---
 .automation/status/
 .automation/dispatch-ledger.json
+.automation/discord-routing.json
+.automation/discord-plan-poller-state.json
 .auto-prep/
+.hermes/
 tasks/*/draft-*.md
 tasks/*/critique-*.md
 tasks/*/summary.md
