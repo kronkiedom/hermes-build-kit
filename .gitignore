@@ -20,3 +20,13 @@ examples/demo-target/tasks/docs-checkpoint-hardening/
 
 # Misc
 *.log
+
+# --- live pipeline instance runtime outputs (root self-install; not committed) ---
+.automation/status/
+.automation/dispatch-ledger.json
+.auto-prep/
+tasks/*/draft-*.md
+tasks/*/critique-*.md
+tasks/*/summary.md
+tasks/*/verify-*.md
+tasks/*/evidence.md

@@ -1,0 +1,16 @@
+{
+  "task_id": "bootstrap-pipeline-install",
+  "created": "2026-06-24T01:26:41.664157+00:00",
+  "state": "CONTRACT-CHECKPOINT",
+  "phase_status": {
+    "SHAPE": "COMPLETED",
+    "CONTRACT-CHECKPOINT": "PROCESSING"
+  },
+  "draft_rounds": 0,
+  "verify_reengage": 0,
+  "operator_approvals": [],
+  "escalations": [],
+  "last_completed_step": "SHAPE",
+  "awaiting_operator": true,
+  "state_reason": "awaiting operator approval of written contract for pipeline self-install"
+}

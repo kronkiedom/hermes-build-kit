@@ -1,0 +1,12 @@
+{
+  "enabled": false,
+  "phase": "bootstrap",
+  "eligibility_kinds": [
+    "docs-only"
+  ],
+  "gate_approval": "operator-defined",
+  "gate2_push_target": "operator-defined (dom-armor pending)",
+  "max_tasks_per_day": null,
+  "gate_timeout": "hold",
+  "note": "Adapted for hermes-build-kit self-install. Autonomy stays disabled until Prompt 5 verification passes and the operator explicitly enables cron + landing policy."
+}
