@@ -360,6 +360,31 @@ class PlanAutomationTests(unittest.TestCase):
         self.assertEqual(status_fingerprint(clean), status_fingerprint({**clean, "head_sha": "b"}))
         self.assertNotEqual(status_fingerprint(comment_only), status_fingerprint(requested))
 
+    def test_pr_status_suppresses_action_comment_after_operator_response(self):
+        pr = {
+            "owner": "dom-armor",
+            "repo": "armor-swarm",
+            "number": 44,
+            "title": "fix: answered comment",
+            "html_url": "https://github.com/dom-armor/armor-swarm/pull/44",
+            "author": "dom-armor",
+            "draft": False,
+            "mergeable_state": "clean",
+            "head_sha": "new-sha",
+            "reviews": [],
+            "check_runs": [],
+            "issue_comments": [
+                {"user": "reviewer", "body": "please fix the stale case", "created_at": "2026-06-25T14:00:00Z", "html_url": "https://github.com/x#old"},
+                {"user": "dom-armor", "body": "Fixed in current head, ready for re-review", "created_at": "2026-06-25T15:00:00Z", "html_url": "https://github.com/x#reply"},
+            ],
+            "review_comments": [],
+        }
+
+        status = classify_pr(pr, operator_login="dom-armor")
+
+        self.assertEqual(status["state"], "OK")
+        self.assertEqual(status["issues"], [])
+
     def test_pr_status_marks_old_review_as_waiting_for_re_review(self):
         pr = {
             "owner": "dom-armor",

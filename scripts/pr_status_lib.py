@@ -8,6 +8,7 @@ import os
 import subprocess
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -130,6 +131,39 @@ def _comment_is_actionable(comment: dict[str, Any], operator_login: str) -> bool
     return any(word in body for word in ACTION_WORDS)
 
 
+def _parse_github_time(value: Any) -> datetime | None:
+    if not value:
+        return None
+    text = str(value)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _latest_operator_issue_comment_time(comments: list[dict[str, Any]], operator_login: str) -> datetime | None:
+    times: list[datetime] = []
+    for comment in comments:
+        if str(_actor_login(comment.get("user"))) != operator_login:
+            continue
+        parsed = _parse_github_time(comment.get("created_at"))
+        if parsed is not None:
+            times.append(parsed)
+    return max(times) if times else None
+
+
+def _comment_after(comment: dict[str, Any], cutoff: datetime | None) -> bool:
+    if cutoff is None:
+        return True
+    created = _parse_github_time(comment.get("created_at"))
+    return created is None or created > cutoff
+
+
 def classify_pr(pr: dict[str, Any], *, operator_login: str) -> dict[str, Any]:
     """Classify one PR for the operator status channel."""
     issues: list[dict[str, Any]] = []
@@ -184,8 +218,10 @@ def classify_pr(pr: dict[str, Any], *, operator_login: str) -> dict[str, Any]:
                 "autocure": "manual_or_targeted_fix",
             })
 
-    for comment in pr.get("issue_comments", []):
-        if _comment_is_actionable(comment, operator_login):
+    issue_comments = pr.get("issue_comments", [])
+    latest_operator_reply = _latest_operator_issue_comment_time(issue_comments, operator_login)
+    for comment in issue_comments:
+        if _comment_after(comment, latest_operator_reply) and _comment_is_actionable(comment, operator_login):
             issues.append({
                 "kind": "issue_comment",
                 "summary": f"PR comment by {_actor_login(comment.get('user'))}: {str(comment.get('body') or '')[:120]}",
