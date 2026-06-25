@@ -28,15 +28,45 @@ The poller accepts messages only from the configured operator user ID.
 
 ## What happens on intake
 
-`scripts/discord-plan-poller.py` polls the build-control channel. For every new operator message containing `build plan:` it:
+`build-control` supports two intake paths:
 
-1. extracts the plan text;
-2. creates one Discord thread for the plan;
-3. writes durable artifacts under `plans/<plan-id>/`;
-4. updates `.automation/plans-index.json`;
-5. posts a short accepted/status message in build-control.
+1. `scripts/discord-plan-poller.py` polls the build-control channel. For every new operator message containing `build plan:` it:
+   1. extracts the plan text;
+   2. creates one Discord thread for the plan;
+   3. writes durable artifacts under `plans/<plan-id>/`;
+   4. updates `.automation/plans-index.json`;
+   5. posts a short accepted/status message in build-control.
+2. `scripts/ingest-source-plan.py` ingests an existing markdown plan file. It first writes a source-status audit and a 5x5 ingest audit under `plans/<plan-id>/`; retired/superseded/blocked source plans fail closed before decomposition unless the operator passes `--force-status-override`.
 
 The first durable state is `CONTRACT`; execution does not begin until the plan is shaped into a contract.
+
+For an existing plan file:
+
+```bash
+python3 scripts/ingest-source-plan.py \
+  --plan-file /path/to/target-repo/docs/plans/example.md \
+  --repo /path/to/target-repo \
+  --base-branch main \
+  --thread-id existing-thread-id \
+  --no-discord
+```
+
+To let a vetted active plan proceed through decomposition and dispatch in one operator-run command, add the explicit gates:
+
+```bash
+python3 scripts/ingest-source-plan.py \
+  --plan-file /path/to/target-repo/docs/plans/example.md \
+  --repo /path/to/target-repo \
+  --base-branch main \
+  --thread-id existing-thread-id \
+  --no-discord \
+  --auto-approve \
+  --decompose \
+  --dispatch \
+  --execute-dispatch
+```
+
+This only prepares the isolated worktree and `builder-prompt.md`; it does not invent code changes or publish a PR. `run-builder-worker.py` and `publish-draft-pr.py` still own those gates.
 
 ## Contract shaping
 

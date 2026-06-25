@@ -10,6 +10,7 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 import pr_status_lib
 import plan_status_lib
+import plan_automation_lib
 from pr_readiness_lib import create_readiness_job, mark_readiness_result, readiness_blocks, validate_review_cleanup_evidence
 from pr_status_lib import apply_stacked_pr_blocks, classify_pr, format_status_message, status_fingerprint, sync_discord_status_channel
 from plan_status_lib import sync_open_plan_threads
@@ -975,6 +976,127 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertFalse(readiness_blocks(passed, current_sha="abc123"))
             self.assertTrue(readiness_blocks(passed, current_sha="def456"))
             self.assertEqual(readiness_blocks(passed, current_sha="def456", explain=True)["reason"], "stale_sha")
+
+    def test_source_plan_ingestion_blocks_retired_plan_before_decomposition(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            source_plan = tmp_path / "retired-plan.md"
+            source_plan.write_text(
+                "# Plan → Executable Workflow\n\n"
+                "## Retired as active plan — 2026-06-25\n\n"
+                "> This document is retained as historical sequencing/audit context only.\n\n"
+                "## Acceptance\n\n- Build the current active work only.\n",
+                encoding="utf-8",
+            )
+
+            result = plan_automation_lib.ingest_source_plan(
+                tmp_path,
+                plan_automation_lib.SourcePlanIngestRequest(
+                    plan_file=source_plan,
+                    repo="/tmp/target-repo",
+                    base_branch="main",
+                    guild_id="guild-1",
+                    control_channel_id="channel-1",
+                    operator_user_id="user-1",
+                    thread_id="thread-1",
+                    no_discord=True,
+                    auto_approve=True,
+                    decompose=True,
+                ),
+            )
+
+            self.assertEqual(result["decision"], "BLOCKED")
+            self.assertEqual(result["status_audit"]["status"], "RETIRED")
+            self.assertIn("retired", result["reason"].lower())
+            plan_dir = Path(result["plan_dir"])
+            self.assertTrue((plan_dir / "source-status-audit.json").exists())
+            self.assertTrue((plan_dir / "source-status-audit.md").exists())
+            self.assertTrue((plan_dir / "readiness-5x5-audit.json").exists())
+            self.assertTrue((plan_dir / "readiness-5x5-audit.md").exists())
+            meta = json.loads((plan_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["state"], "QUESTION")
+            self.assertIs(meta["awaiting_operator"], True)
+            self.assertFalse((tmp_path / "tasks").exists())
+
+    def test_source_plan_ingestion_can_approve_decompose_and_dispatch_active_plan(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            remote = tmp_path / "remote.git"
+            target = tmp_path / "target"
+            subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True, text=True)
+            subprocess.run(["git", "clone", str(remote), str(target)], check=True, capture_output=True, text=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=target, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=target, check=True)
+            (target / "README.md").write_text("# target\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=target, check=True)
+            subprocess.run(["git", "commit", "-m", "initial"], cwd=target, check=True, capture_output=True, text=True)
+            subprocess.run(["git", "branch", "-M", "main"], cwd=target, check=True)
+            subprocess.run(["git", "push", "-u", "origin", "main"], cwd=target, check=True, capture_output=True, text=True)
+
+            source_plan = tmp_path / "active-plan.md"
+            source_plan.write_text(
+                "# Build dashboard polish\n\n"
+                "**Status:** Active — ready to build.\n\n"
+                "## Done means\n\n"
+                "- Update README docs.\n"
+                "- Run tests or record verification.\n",
+                encoding="utf-8",
+            )
+
+            result = plan_automation_lib.ingest_source_plan(
+                tmp_path,
+                plan_automation_lib.SourcePlanIngestRequest(
+                    plan_file=source_plan,
+                    repo=str(target),
+                    base_branch="main",
+                    guild_id="guild-1",
+                    control_channel_id="channel-1",
+                    operator_user_id="user-1",
+                    thread_id="thread-1",
+                    no_discord=True,
+                    auto_approve=True,
+                    decompose=True,
+                    dispatch=True,
+                    execute_dispatch=True,
+                ),
+            )
+
+            self.assertEqual(result["decision"], "DISPATCHED")
+            self.assertEqual(result["status_audit"]["status"], "ACTIVE")
+            self.assertEqual(result["readiness_5x5"]["failed"], 0)
+            self.assertEqual(result["decomposition"]["packet_count"], 2)
+            dispatch = result["dispatch"]
+            self.assertEqual(dispatch["decision"], "DISPATCHED")
+            task_dir = tmp_path / "tasks" / dispatch["task_id"]
+            self.assertTrue((task_dir / "builder-prompt.md").exists())
+            task_meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(task_meta["state"], "EXECUTE")
+            self.assertTrue(Path(task_meta["dispatch"]["worktree"]).exists())
+
+    def test_source_plan_ingest_5x5_resolves_relative_repo_against_repo_root(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            target = tmp_path / "target"
+            subprocess.run(["git", "init", str(target)], check=True, capture_output=True, text=True)
+            markdown = "# Build docs\n\n**Status:** Active — ready.\n\n- Acceptance: update docs.\n"
+            status_audit = plan_automation_lib.audit_source_plan_status(markdown, source_path="plan.md")
+
+            audit = plan_automation_lib.build_ingest_5x5_audit(
+                markdown,
+                plan_automation_lib.SourcePlanIngestRequest(
+                    plan_file=tmp_path / "plan.md",
+                    repo="target",
+                    thread_id="thread-1",
+                    no_discord=True,
+                    dispatch=True,
+                ),
+                status_audit,
+                repo_root=tmp_path,
+            )
+
+            repo_check = next(item for item in audit["checks"] if item["code"] == "R1")
+            self.assertEqual(repo_check["status"], "PASS")
+            self.assertEqual(audit["failed"], 0)
 
 
 if __name__ == "__main__":

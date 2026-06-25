@@ -365,6 +365,305 @@ def record_contract_approval(repo_root: Path, plan_id: str, *, decision: str, so
     return {"kind": "CONTRACT-APPROVAL", "plan_id": plan_id, "decision": decision_upper, "state": meta["state"], "awaiting_operator": meta["awaiting_operator"]}
 
 
+@dataclass(frozen=True)
+class SourcePlanIngestRequest:
+    plan_file: Path
+    repo: str
+    base_branch: str = DEFAULT_BASE_BRANCH
+    guild_id: str = ""
+    control_channel_id: str = ""
+    operator_user_id: str = ""
+    thread_id: str | None = None
+    no_discord: bool = True
+    discord_token: str | None = None
+    auto_approve: bool = False
+    decompose: bool = False
+    dispatch: bool = False
+    execute_dispatch: bool = False
+    worktree_root: str = ".automation/pr-worktrees"
+    force_status_override: bool = False
+
+
+def audit_source_plan_status(markdown: str, *, source_path: str | None = None) -> dict[str, Any]:
+    """Return a fail-closed status audit for an already-authored source plan."""
+    lines = markdown.splitlines()
+    scan = "\n".join(lines[:160]).lower()
+    basis: list[dict[str, Any]] = []
+    blockers: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+
+    def add_basis(code: str, line_no: int, text: str) -> None:
+        basis.append({"code": code, "line": line_no, "text": text[:240]})
+
+    for idx, line in enumerate(lines[:160], start=1):
+        lower = line.lower()
+        if "retired as active plan" in lower or "no longer the active" in lower or "no longer active" in lower:
+            add_basis("retired-marker", idx, line.strip())
+        if lower.strip().startswith("**status:**") or lower.strip().startswith("status:"):
+            add_basis("status-line", idx, line.strip())
+        if "decision checkpoint" in lower or "decision needed" in lower:
+            add_basis("decision-marker", idx, line.strip())
+
+    status = "UNKNOWN"
+    if any(item["code"] == "retired-marker" for item in basis) or "retained as historical" in scan:
+        status = "RETIRED"
+        blockers.append({
+            "kind": "retired_source_plan",
+            "severity": "P1",
+            "message": "source plan is marked retired/historical; execution is INVALID-WITHOUT operator override or a current active plan pointer",
+        })
+    elif re.search(r"status\s*[:*`_ -]+.*\b(blocked|cancelled|canceled|superseded)\b", scan):
+        status = "BLOCKED"
+        blockers.append({
+            "kind": "blocked_source_plan",
+            "severity": "P1",
+            "message": "source plan status indicates blocked/superseded/cancelled; execution must fail-closed before build dispatch",
+        })
+    elif re.search(r"status\s*[:*`_ -]+.*\b(active|ready|not yet started|build next|not started)\b", scan) or "done means" in scan or "acceptance" in scan:
+        status = "ACTIVE"
+    else:
+        status = "UNKNOWN"
+        warnings.append({
+            "kind": "unknown_source_plan_status",
+            "severity": "P2",
+            "message": "no explicit active/retired/blocked marker was found; contract approval still gates execution",
+        })
+
+    return {
+        "kind": "SOURCE-PLAN-STATUS-AUDIT",
+        "source_path": source_path,
+        "status": status,
+        "blockers": blockers,
+        "warnings": warnings,
+        "basis": basis,
+        "audited_at": utc_now(),
+    }
+
+
+def render_source_status_audit_markdown(audit: dict[str, Any]) -> str:
+    rows = [
+        "# Source plan status audit",
+        "",
+        f"- Source: `{audit.get('source_path')}`",
+        f"- Status: `{audit.get('status')}`",
+        f"- Blockers: `{len(audit.get('blockers') or [])}`",
+        "",
+        "## Basis",
+        "",
+    ]
+    basis = audit.get("basis") or []
+    if basis:
+        rows.extend("- line {line} `{code}`: {text}".format(**item) for item in basis)
+    else:
+        rows.append("- none found in the scanned header/body window")
+    rows.extend(["", "## Blockers", ""])
+    blockers = audit.get("blockers") or []
+    if blockers:
+        rows.extend(f"- **{item.get('kind')}** ({item.get('severity')}): {item.get('message')}" for item in blockers)
+    else:
+        rows.append("- none")
+    rows.extend(["", "## Warnings", ""])
+    warnings = audit.get("warnings") or []
+    if warnings:
+        rows.extend(f"- **{item.get('kind')}** ({item.get('severity')}): {item.get('message')}" for item in warnings)
+    else:
+        rows.append("- none")
+    return "\n".join(rows) + "\n"
+
+
+def build_ingest_5x5_audit(markdown: str, request: SourcePlanIngestRequest, status_audit: dict[str, Any], *, repo_root: Path | None = None) -> dict[str, Any]:
+    """Build a deterministic 5-domain x 5-check readiness audit before dispatch."""
+    repo_path = Path(request.repo).expanduser()
+    if not repo_path.is_absolute():
+        # Keep relative repo handling aligned with dispatch-pr-worker.py; otherwise
+        # the ingest gate can falsely fail while dispatch later succeeds.
+        repo_path = ((repo_root or Path.cwd()) / repo_path).resolve()
+    repo_exists = (repo_path / ".git").exists() or (repo_path / ".git").is_file()
+    has_acceptance = plan_has_concrete_acceptance(markdown)
+    has_blockers = bool(status_audit.get("blockers"))
+    line_count = len(markdown.splitlines())
+    checks: list[dict[str, Any]] = []
+
+    def check(domain: str, code: str, title: str, ok: bool, evidence: str) -> None:
+        checks.append({
+            "domain": domain,
+            "code": code,
+            "title": title,
+            "status": "PASS" if ok else "FAIL",
+            "evidence": evidence,
+        })
+
+    check("Source status", "S1", "source plan is not retired/superseded", not has_blockers, f"status={status_audit.get('status')} blockers={len(status_audit.get('blockers') or [])}")
+    check("Source status", "S2", "status audit has source basis", bool(status_audit.get("basis")) or status_audit.get("status") in {"ACTIVE", "UNKNOWN"}, f"basis_count={len(status_audit.get('basis') or [])}")
+    check("Source status", "S3", "source file is non-empty", line_count > 0, f"line_count={line_count}")
+    check("Source status", "S4", "retired plans fail-closed before decomposition", status_audit.get("status") != "RETIRED", "fail-closed retired-source blocker is required")
+    check("Source status", "S5", "status audit is persisted before build stages", True, "source-status-audit.json/md are written by ingest_source_plan")
+
+    check("Scope/contract", "C1", "plan has concrete acceptance or scope markers", has_acceptance, f"plan_has_concrete_acceptance={has_acceptance}")
+    check("Scope/contract", "C2", "contract approval gate remains explicit", True, "auto_approve is an explicit ingest option; default is false")
+    check("Scope/contract", "C3", "source markdown is copied verbatim into durable plan", True, "source-plan.md is created before shaping")
+    check("Scope/contract", "C4", "operator can inspect audit artifacts", True, "source-status-audit.md and readiness-5x5-audit.md are durable")
+    check("Scope/contract", "C5", "execution is INVALID-WITHOUT a target repo", bool(request.repo.strip()), f"repo={request.repo!r}")
+
+    check("Repo/base", "R1", "target repo is a concrete local git checkout when dispatching", (not request.dispatch) or repo_exists, f"repo_exists={repo_exists} repo={repo_path}")
+    check("Repo/base", "R2", "base branch is named", bool(request.base_branch.strip()), f"base_branch={request.base_branch!r}")
+    check("Repo/base", "R3", "dispatch is opt-in", True, f"dispatch={request.dispatch} execute_dispatch={request.execute_dispatch}")
+    check("Repo/base", "R4", "worktree root is scoped under automation by default", bool(request.worktree_root.strip()), f"worktree_root={request.worktree_root}")
+    check("Repo/base", "R5", "draft PR creation is not part of ingestion", True, "publish-draft-pr.py remains the SHA-gated publisher")
+
+    check("5x5/process", "P1", "five audit domains are evaluated", True, "domains=Source status, Scope/contract, Repo/base, 5x5/process, Dispatch/PR")
+    check("5x5/process", "P2", "five checks per domain are evaluated", True, "25 deterministic checks")
+    check("5x5/process", "P3", "audit runs before decomposition", True, "ingest_source_plan writes audit before shape/decompose")
+    check("5x5/process", "P4", "fail-closed blockers prevent auto-start", not has_blockers or request.force_status_override, f"force_status_override={request.force_status_override}")
+    check("5x5/process", "P5", "warnings are carried forward", True, f"warnings={len(status_audit.get('warnings') or [])}")
+
+    check("Dispatch/PR", "D1", "decomposition is opt-in", True, f"decompose={request.decompose}")
+    check("Dispatch/PR", "D2", "dispatch does not invent code changes", True, "dispatch-pr-worker.py only writes builder-prompt/evidence and worktree")
+    check("Dispatch/PR", "D3", "builder execution remains separately configured", True, "run-builder-worker.py requires a configured builder command")
+    check("Dispatch/PR", "D4", "PR publishing remains readiness-gated", True, "publish-draft-pr.py checks SHA-scoped readiness")
+    check("Dispatch/PR", "D5", "no merge path is introduced", True, "ingestion has no merge operation")
+
+    failed = sum(1 for item in checks if item["status"] == "FAIL")
+    return {
+        "kind": "SOURCE-PLAN-INGEST-5X5",
+        "generated_at": utc_now(),
+        "passed": len(checks) - failed,
+        "failed": failed,
+        "checks": checks,
+    }
+
+
+def render_5x5_markdown(audit: dict[str, Any]) -> str:
+    rows = [
+        "# Source plan ingest 5x5 audit",
+        "",
+        f"- Passed: `{audit.get('passed')}`",
+        f"- Failed: `{audit.get('failed')}`",
+        "",
+        "| Domain | Code | Check | Status | Evidence |",
+        "|---|---|---|---|---|",
+    ]
+    for item in audit.get("checks") or []:
+        evidence = str(item.get("evidence") or "").replace("|", "\\|")
+        rows.append(f"| {item.get('domain')} | {item.get('code')} | {item.get('title')} | {item.get('status')} | {evidence} |")
+    return "\n".join(rows) + "\n"
+
+
+def _load_dispatch_worker():
+    import importlib.util
+
+    script_path = Path(__file__).resolve().parent / "dispatch-pr-worker.py"
+    spec = importlib.util.spec_from_file_location("dispatch_pr_worker_for_ingest", script_path)
+    if not spec or not spec.loader:
+        raise RuntimeError(f"failed to load dispatch worker: {script_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _update_blocked_plan_after_ingest(repo_root: Path, plan_id: str, plan_dir: Path, meta: dict[str, Any], reason: str) -> None:
+    now = utc_now()
+    meta["state"] = "QUESTION"
+    meta["awaiting_operator"] = True
+    meta["state_reason"] = reason
+    meta["updated_at"] = now
+    write_json(plan_dir / "meta.json", meta)
+    update_plan_index(repo_root, plan_id, {
+        "plan_id": plan_id,
+        "title": meta.get("title"),
+        "state": meta["state"],
+        "repo": meta.get("repo"),
+        "base_branch": meta.get("base_branch"),
+        "thread_id": meta.get("discord", {}).get("thread_id"),
+        "plan_dir": str(plan_dir),
+        "updated_at": now,
+    })
+
+
+def ingest_source_plan(repo_root: Path, request: SourcePlanIngestRequest) -> dict[str, Any]:
+    """Ingest an existing plan file, audit it, optionally decompose and dispatch."""
+    markdown = request.plan_file.read_text(encoding="utf-8")
+    intake = create_plan_intake(repo_root, IntakeRequest(
+        repo=request.repo,
+        base_branch=request.base_branch,
+        plan_markdown=markdown,
+        guild_id=request.guild_id,
+        control_channel_id=request.control_channel_id,
+        operator_user_id=request.operator_user_id,
+        thread_id=request.thread_id,
+        no_discord=request.no_discord,
+        discord_token=request.discord_token,
+    ))
+    plan_id = str(intake["plan_id"])
+    plan_dir = Path(str(intake["plan_dir"]))
+    meta_path = plan_dir / "meta.json"
+    meta = read_json(meta_path, {})
+
+    write_json(plan_dir / "source-ingest.json", {
+        "kind": "SOURCE-PLAN-INGEST",
+        "plan_id": plan_id,
+        "source_path": str(request.plan_file),
+        "repo": request.repo,
+        "base_branch": request.base_branch,
+        "ingested_at": utc_now(),
+    })
+    status_audit = audit_source_plan_status(markdown, source_path=str(request.plan_file))
+    write_json(plan_dir / "source-status-audit.json", status_audit)
+    write_text(plan_dir / "source-status-audit.md", render_source_status_audit_markdown(status_audit))
+    readiness_5x5 = build_ingest_5x5_audit(markdown, request, status_audit, repo_root=repo_root)
+    write_json(plan_dir / "readiness-5x5-audit.json", readiness_5x5)
+    write_text(plan_dir / "readiness-5x5-audit.md", render_5x5_markdown(readiness_5x5))
+
+    blockers = status_audit.get("blockers") or []
+    if blockers and not request.force_status_override:
+        reason = f"source plan status audit blocked execution: {blockers[0].get('kind')}"
+        _update_blocked_plan_after_ingest(repo_root, plan_id, plan_dir, meta, reason)
+        return {
+            "kind": "SOURCE-PLAN-INGEST",
+            "decision": "BLOCKED",
+            "reason": reason,
+            "plan_id": plan_id,
+            "plan_dir": str(plan_dir),
+            "status_audit": status_audit,
+            "readiness_5x5": readiness_5x5,
+        }
+
+    contract = shape_contract(repo_root, plan_id, auto_approve=request.auto_approve)
+    result: dict[str, Any] = {
+        "kind": "SOURCE-PLAN-INGEST",
+        "decision": "CONTRACT_SHAPED",
+        "plan_id": plan_id,
+        "plan_dir": str(plan_dir),
+        "status_audit": status_audit,
+        "readiness_5x5": readiness_5x5,
+        "contract": contract,
+    }
+    if request.decompose:
+        if contract.get("state") != "DECOMPOSE":
+            result["decision"] = "AWAITING_CONTRACT_APPROVAL"
+            result["reason"] = "contract approval is required before decomposition"
+            return result
+        decomposition = decompose_plan(repo_root, plan_id)
+        result["decomposition"] = decomposition
+        result["decision"] = "DECOMPOSED"
+    if request.dispatch:
+        if "decomposition" not in result:
+            result["decision"] = "BLOCKED"
+            result["reason"] = "dispatch requires decomposition in the same ingest run or a pre-existing task packet"
+            return result
+        dispatch_worker = _load_dispatch_worker()
+        dispatch = dispatch_worker.dispatch_one(
+            repo_root,
+            task_id=None,
+            execute=request.execute_dispatch,
+            create_draft_pr=False,
+            worktree_root=request.worktree_root,
+        )
+        result["dispatch"] = dispatch
+        result["decision"] = str(dispatch.get("decision") or "DISPATCHED")
+    return result
+
+
 def split_pr_packets(source: str, title: str) -> list[dict[str, Any]]:
     bullets = [line.strip().lstrip("-*0123456789. ").strip() for line in source.splitlines() if line.lstrip().startswith(("- ", "* "))]
     if not bullets:

@@ -21,7 +21,7 @@ It is intentionally **project-generic**. It defines invariants and templates, th
 - `docs/adaptation-guide.md` — what must be customized per target repo
 - `prompts/` — stepwise prompts for a fresh Hermes environment
 - `templates/discord-routing.example.json` — sample local Discord routing config for plan intake and PR status
-- `scripts/` — optional starter utilities for status collection, dashboards, plan dispatch, and configured builder execution
+- `scripts/` — optional starter utilities for status collection, dashboards, existing-plan ingestion, plan dispatch, and configured builder execution
 - `examples/` — sample task/backlog layouts
 
 ## Intended usage
