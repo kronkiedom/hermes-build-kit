@@ -1,0 +1,14 @@
+{
+  "guild_id": "DISCORD_GUILD_ID",
+  "build_control_channel_id": "DISCORD_BUILD_CONTROL_CHANNEL_ID",
+  "general_channel_id": "DISCORD_GENERAL_CHANNEL_ID",
+  "pr_status_channel_id": "DISCORD_PR_STATUS_CHANNEL_ID",
+  "pr_status_channel_name": "pr-status",
+  "pr_status_query_extra": "repo:owner/repo",
+  "operator_user_id": "DISCORD_OPERATOR_USER_ID",
+  "operator_github_login": "GITHUB_LOGIN",
+  "default_repo": "owner/repo-or-absolute-path",
+  "default_base_branch": "main",
+  "trigger": "build plan:",
+  "notes": "Copy to .automation/discord-routing.json in the target environment. Do not commit real guild/channel/user IDs to portable repos unless that repo is intentionally environment-specific."
+}

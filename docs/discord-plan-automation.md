@@ -1,0 +1,184 @@
+# Discord plan-to-PR automation MVP
+
+This repo now has a Discord-facing intake layer on top of the durable automation scaffold.
+
+## Channels
+
+The current Discord routing is stored in `.automation/discord-routing.json`.
+
+- `build-control` — operator drops new plan requests here.
+- `hermes-general` — normal Hermes chat / general inquiries.
+
+The build-control trigger is:
+
+```text
+build plan: <plan text>
+```
+
+Example:
+
+```text
+build plan: # Add billing settings
+- Add a settings page for billing email
+- Persist billing email in the user profile
+- Add tests for validation
+```
+
+The poller accepts messages only from the configured operator user ID.
+
+## What happens on intake
+
+`build-control` supports two intake paths:
+
+1. `scripts/discord-plan-poller.py` polls the build-control channel. For every new operator message containing `build plan:` it:
+   1. extracts the plan text;
+   2. creates one Discord thread for the plan;
+   3. writes durable artifacts under `plans/<plan-id>/`;
+   4. updates `.automation/plans-index.json`;
+   5. posts a short accepted/status message in build-control.
+2. `scripts/ingest-source-plan.py` ingests an existing markdown plan file. It first writes a source-status audit and a 5x5 ingest audit under `plans/<plan-id>/`; retired/superseded/blocked source plans fail closed before decomposition unless the operator passes `--force-status-override`.
+
+The first durable state is `CONTRACT`; execution does not begin until the plan is shaped into a contract.
+
+For an existing plan file:
+
+```bash
+python3 scripts/ingest-source-plan.py \
+  --plan-file /path/to/target-repo/docs/plans/example.md \
+  --repo /path/to/target-repo \
+  --base-branch main \
+  --thread-id existing-thread-id \
+  --no-discord
+```
+
+To let a vetted active plan proceed through decomposition and dispatch in one operator-run command, add the explicit gates:
+
+```bash
+python3 scripts/ingest-source-plan.py \
+  --plan-file /path/to/target-repo/docs/plans/example.md \
+  --repo /path/to/target-repo \
+  --base-branch main \
+  --thread-id existing-thread-id \
+  --no-discord \
+  --auto-approve \
+  --decompose \
+  --dispatch \
+  --execute-dispatch
+```
+
+This only prepares the isolated worktree and `builder-prompt.md`; it does not invent code changes or publish a PR. `run-builder-worker.py` and `publish-draft-pr.py` still own those gates.
+
+## Contract shaping
+
+Run:
+
+```bash
+python3 scripts/shape-plan-contract.py --plan-id <plan-id>
+```
+
+If the plan is ambiguous, the script writes `questions.md`, sets the plan state to `QUESTION`, and sets `awaiting_operator: true`.
+
+If the contract is concrete, the script stops at `CONTRACT_REVIEW`; concrete text is not treated as approval. Approve or reject the contract explicitly:
+
+```bash
+python3 scripts/approve-plan-contract.py --plan-id <plan-id> --decision APPROVE
+```
+
+For a controlled/manual approval during development only:
+
+```bash
+python3 scripts/shape-plan-contract.py --plan-id <plan-id> --auto-approve
+```
+
+## PR decomposition
+
+After the contract is ready:
+
+```bash
+python3 scripts/decompose-plan-to-prs.py --plan-id <plan-id>
+```
+
+This creates PR-sized task packets under `tasks/` and writes `plans/<plan-id>/prs.json` plus `decomposition.md`.
+
+## Cron
+
+A Hermes cron job named `bk-discord-plan-poller` runs every minute. The wrapper at `~/.hermes/scripts/bk-discord-plan-poller.py` stays silent unless it accepts a new plan, so it should not spam local delivery.
+
+## Current boundary
+
+The intake/contract/decomposition layers are implemented. Execution is now split into two deterministic workers:
+
+1. `scripts/dispatch-pr-worker.py` selects one eligible task packet, validates that the target repo is a concrete local git checkout, prepares an isolated git worktree/branch, writes `builder-prompt.md`, `summary.md`, and `evidence.md`, and queues an initial SHA-scoped PR-readiness gate for the base dispatch SHA.
+2. `scripts/run-builder-worker.py` consumes the dispatched packet, runs an operator/configured builder command inside the isolated worktree, records command output and build evidence, commits produced changes, and queues the SHA-scoped PR-readiness gate for the new commit.
+
+3. `scripts/publish-draft-pr.py` publishes a draft GitHub PR only after the task's recorded readiness job passes for the worktree's current HEAD SHA. Without `--execute`, it dry-runs and reports `WOULD_PUBLISH`.
+
+The workers do **not** invent code changes by themselves and do not create empty PRs. Draft PR creation happens only after a builder command has produced commits and the readiness gate passes for that exact commit.
+
+For a safe dispatch dry run:
+
+```bash
+python3 scripts/dispatch-pr-worker.py
+```
+
+To prepare the isolated worktree for the next eligible packet:
+
+```bash
+python3 scripts/dispatch-pr-worker.py --execute
+```
+
+To run a builder command against the dispatched worktree:
+
+```bash
+python3 scripts/run-builder-worker.py \
+  --task-id <task-id> \
+  --builder-command '<command that reads $BUILDER_PROMPT_PATH and edits the worktree>'
+```
+
+The builder command receives these environment variables:
+
+- `BUILD_TASK_ID`
+- `BUILD_TASK_DIR`
+- `BUILDER_PROMPT_PATH`
+- `BUILDER_SUMMARY_PATH`
+- `BUILDER_EVIDENCE_PATH`
+
+If no command is passed, the worker reads `HERMES_BUILDER_COMMAND`.
+
+To dry-run draft PR publishing after readiness passes:
+
+```bash
+python3 scripts/publish-draft-pr.py --task-id <task-id>
+```
+
+To actually push the task branch and create the draft PR:
+
+```bash
+python3 scripts/publish-draft-pr.py --task-id <task-id> --execute
+```
+
+The publisher refuses to push or call `gh pr create` if the readiness job is stale, missing, or failed for the current worktree SHA.
+
+## PR readiness and status channel
+
+See `docs/pr-readiness-and-status-channel.md` for the SHA-scoped readiness gate and PR status channel monitor.
+
+The readiness gate is event-based: call `scripts/pr-readiness-gate.py` when a branch is about to be claimed PR-ready. It certifies one commit SHA and blocks only ready-for-review / merge-ready claims for stale or failed audits; it does not block continued building.
+
+The PR status monitor is safe-by-default: `scripts/github-pr-status-monitor.py` updates one Discord message per open operator-authored PR and opens/pings an issue thread when reviews, comments, failing checks, or rebase states need attention.
+
+## Open plan router and thread replies
+
+`scripts/open-plan-router.py` classifies each open plan into the next safe handler/action. It makes stalled-looking `CONTRACT` plans explicit (`shape_contract`, `agent_required`) and routes `EXECUTING` plans to `scripts/dispatch-pr-worker.py` when the dispatcher exists.
+
+`scripts/discord-plan-thread-poller.py` ingests operator replies from active plan threads. Replies to `QUESTION` plans are appended to `operator-replies.jsonl` and move the plan back to `CONTRACT` for reshaping. `approve` / `reject` / `cancel` replies to `CONTRACT_REVIEW` are recorded in `approvals.json`; approval moves the plan to `DECOMPOSE`.
+
+## Open plan status monitor
+
+`scripts/open-plan-status-monitor.py` applies the same "alert once, then suppress" contract to build-control plans:
+
+- active plans in `CONTRACT`, `DECOMPOSE`, `EXECUTING`, or verification-style states update durable status but do not ping repeatedly;
+- plans in `QUESTION` or with `awaiting_operator: true` ping the configured operator once in the plan thread and then suppress duplicates while the same operator action is pending;
+- when a plan reaches `DONE` or `CANCELLED`, the monitor posts a terminal summary and archives/locks the plan thread so stale plan threads close automatically.
+
+The monitor writes `.automation/plan-status-ledger.json` and `.automation/status/open-plan-status-last.json`.
