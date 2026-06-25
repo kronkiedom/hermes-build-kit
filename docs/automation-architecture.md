@@ -86,6 +86,8 @@ Outputs commonly include:
 ### 7. Stall detector
 Flags tasks or workers that appear stuck.
 
+Starter implementation: `scripts/stall-detector.py` scans active task metadata and `.automation/status/*-last.json` worker ledgers. It writes `.automation/status/stall-detector-last.json` with `decision: CLEAR|STALLS_FOUND` and a list of stale tasks/workers. The default threshold is 24 hours and can be overridden with `--stale-hours`.
+
 ## Suggested default policy
 - one active task at a time
 - idle checks every 5 minutes

@@ -278,9 +278,16 @@ def shape_contract(repo_root: Path, plan_id: str, auto_approve: bool = False) ->
                 "timestamp": now,
             })
             write_json(plan_dir / "approvals.json", approvals)
-        meta["state"] = "DECOMPOSE"
-        meta["awaiting_operator"] = False
-        meta["state_reason"] = "contract shaped and ready for PR decomposition"
+            meta["state"] = "DECOMPOSE"
+            meta["awaiting_operator"] = False
+            meta["state_reason"] = "contract shaped and approved; ready for PR decomposition"
+        else:
+            # Concrete contract text is not the same thing as operator approval.
+            # Stop at a checkpoint so PR decomposition/execution cannot begin until
+            # the operator explicitly approves the contract artifact.
+            meta["state"] = "CONTRACT_REVIEW"
+            meta["awaiting_operator"] = True
+            meta["state_reason"] = "contract shaped; awaiting operator approval before PR decomposition"
     meta["updated_at"] = now
     write_json(meta_path, meta)
     update_plan_index(
@@ -305,6 +312,57 @@ def shape_contract(repo_root: Path, plan_id: str, auto_approve: bool = False) ->
         "question_count": len(questions) if meta["awaiting_operator"] else 0,
         "contract_path": str(plan_dir / "contract.md"),
     }
+
+
+def record_contract_approval(repo_root: Path, plan_id: str, *, decision: str, source: str = "operator", message_id: str | None = None) -> dict[str, Any]:
+    plan_dir = repo_root / "plans" / plan_id
+    meta_path = plan_dir / "meta.json"
+    meta = read_json(meta_path, None)
+    if not meta:
+        raise FileNotFoundError(f"missing plan meta: {meta_path}")
+    decision_upper = decision.strip().upper()
+    if decision_upper not in {"APPROVE", "REJECT", "CANCEL"}:
+        raise ValueError("decision must be APPROVE, REJECT, or CANCEL")
+    if meta.get("state") not in {"CONTRACT_REVIEW", "QUESTION"}:
+        raise RuntimeError(f"plan {plan_id} is not awaiting contract approval; state={meta.get('state')}")
+    now = utc_now()
+    approvals = read_json(plan_dir / "approvals.json", {"approvals": []})
+    event = {
+        "artifact": "contract.md",
+        "decision": decision_upper,
+        "source": source,
+        "timestamp": now,
+    }
+    if message_id:
+        event["message_id"] = message_id
+    approvals.setdefault("approvals", []).append(event)
+    write_json(plan_dir / "approvals.json", approvals)
+
+    if decision_upper == "APPROVE":
+        meta["state"] = "DECOMPOSE"
+        meta["awaiting_operator"] = False
+        meta["state_reason"] = "contract approved; ready for PR decomposition"
+    else:
+        meta["state"] = "CANCELLED"
+        meta["awaiting_operator"] = False
+        meta["state_reason"] = f"contract {decision_upper.lower()} by operator"
+    meta["updated_at"] = now
+    write_json(meta_path, meta)
+    update_plan_index(
+        repo_root,
+        plan_id,
+        {
+            "plan_id": plan_id,
+            "title": meta.get("title"),
+            "state": meta["state"],
+            "repo": meta.get("repo"),
+            "base_branch": meta.get("base_branch"),
+            "thread_id": meta.get("discord", {}).get("thread_id"),
+            "plan_dir": str(plan_dir),
+            "updated_at": now,
+        },
+    )
+    return {"kind": "CONTRACT-APPROVAL", "plan_id": plan_id, "decision": decision_upper, "state": meta["state"], "awaiting_operator": meta["awaiting_operator"]}
 
 
 def split_pr_packets(source: str, title: str) -> list[dict[str, Any]]:
