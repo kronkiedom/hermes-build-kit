@@ -978,6 +978,14 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertTrue(readiness_blocks(passed, current_sha="def456"))
             self.assertEqual(readiness_blocks(passed, current_sha="def456", explain=True)["reason"], "stale_sha")
 
+    def test_source_plan_status_treats_authoritative_current_design_as_active(self):
+        markdown = "# Upgrade plan\n\n**Status:** Authoritative current design — the single source of truth.\n"
+        audit = plan_automation_lib.audit_source_plan_status(markdown, source_path="plan.md")
+
+        self.assertEqual(audit["status"], "ACTIVE")
+        self.assertEqual(audit["blockers"], [])
+        self.assertEqual(audit["warnings"], [])
+
     def test_source_plan_ingestion_blocks_retired_plan_before_decomposition(self):
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
@@ -1166,6 +1174,41 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertTrue(decision_meta["awaiting_operator"])
             questions = (Path(tasks["decision_required"]["task_dir"]) / "questions.md").read_text(encoding="utf-8")
             self.assertIn("Decision needed", questions)
+
+    def test_redecompose_preserves_existing_task_discord_thread_ids(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            plan_id = "plan-upgrade"
+            plan_dir = tmp_path / "plans" / plan_id
+            plan_dir.mkdir(parents=True)
+            (tmp_path / ".automation").mkdir()
+            source = """# Upgrade / Migration workflow
+
+**Open review stack:** PR-B3 fan-out is #713 (`feat/upgrade-fanout-verify`, open and mergeable at audit time). Fan-out SPEND admission is #725, stacked on #713 and inert until the stack lands.
+
+**Deferred by user decision:** PR-B4 / H7 real empirical verify is deferred until after #713 and #725 merge.
+"""
+            (plan_dir / "source-plan.md").write_text(source, encoding="utf-8")
+            (plan_dir / "meta.json").write_text(json.dumps({
+                "plan_id": plan_id,
+                "title": "Upgrade / Migration workflow",
+                "state": "DECOMPOSE",
+                "repo": "/tmp/target",
+                "base_branch": "main",
+                "discord": {"thread_id": "plan-thread"},
+                "awaiting_operator": False,
+            }), encoding="utf-8")
+
+            first = plan_automation_lib.decompose_plan(tmp_path, plan_id)
+            maint_dir = Path(next(t for t in first["tasks"] if t["kind"] == "pr_maintenance")["task_dir"])
+            maint_meta = json.loads((maint_dir / "meta.json").read_text(encoding="utf-8"))
+            maint_meta["discord"]["thread_id"] = "thread-pr725"
+            (maint_dir / "meta.json").write_text(json.dumps(maint_meta), encoding="utf-8")
+
+            plan_automation_lib.decompose_plan(tmp_path, plan_id)
+
+            redecomposed = json.loads((maint_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(redecomposed["discord"]["thread_id"], "thread-pr725")
 
     def test_ensure_build_threads_dry_run_lists_each_in_flight_task_thread(self):
         with tempfile.TemporaryDirectory() as td:

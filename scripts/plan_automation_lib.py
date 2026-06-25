@@ -419,7 +419,12 @@ def audit_source_plan_status(markdown: str, *, source_path: str | None = None) -
             "severity": "P1",
             "message": "source plan status indicates blocked/superseded/cancelled; execution must fail-closed before build dispatch",
         })
-    elif re.search(r"status\s*[:*`_ -]+.*\b(active|ready|not yet started|build next|not started)\b", scan) or "done means" in scan or "acceptance" in scan:
+    elif (
+        re.search(r"status\s*[:*`_ -]+.*\b(active|ready|not yet started|build next|not started|authoritative current design|current design|source of truth)\b", scan)
+        or "remains active" in scan
+        or "done means" in scan
+        or "acceptance" in scan
+    ):
         status = "ACTIVE"
     else:
         status = "UNKNOWN"
@@ -800,6 +805,8 @@ def decompose_plan(repo_root: Path, plan_id: str) -> dict[str, Any]:
         task_id = f"{plan_id}-{packet['packet_id']}"
         packet["task_id"] = task_id
         task_dir = repo_root / "tasks" / task_id
+        existing_task_meta = read_json(task_dir / "meta.json", {})
+        existing_discord = existing_task_meta.get("discord") if isinstance(existing_task_meta, dict) and isinstance(existing_task_meta.get("discord"), dict) else {}
         kind = str(packet.get("kind") or "build")
         task_state = "SHAPE"
         awaiting_operator = False
@@ -815,6 +822,18 @@ def decompose_plan(repo_root: Path, plan_id: str) -> dict[str, Any]:
             state_reason = "decision prompt required before this build can start"
             phase_status = {"DECISION": "NEEDS_OPERATOR"}
 
+        packet_discord_raw = packet.get("discord")
+        packet_discord: dict[str, Any] = {}
+        if isinstance(packet_discord_raw, dict):
+            for k, v in packet_discord_raw.items():
+                packet_discord[str(k)] = v
+        existing_discord_map: dict[str, Any] = {}
+        if isinstance(existing_discord, dict):
+            for k, v in existing_discord.items():
+                existing_discord_map[str(k)] = v
+        merged_discord: dict[str, Any] = {}
+        merged_discord.update(packet_discord)
+        merged_discord.update(existing_discord_map)
         task_meta = {
             "task_id": task_id,
             "source_plan_id": plan_id,
@@ -826,7 +845,7 @@ def decompose_plan(repo_root: Path, plan_id: str) -> dict[str, Any]:
             "state_reason": state_reason,
             "created": now,
             "pr_packet": packet,
-            "discord": packet.get("discord", {}),
+            "discord": {**packet_discord, **existing_discord},
         }
         task_md = (
             f"# Task: {packet['title']}\n\n"
