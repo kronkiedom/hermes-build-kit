@@ -68,6 +68,14 @@ python3 scripts/ingest-source-plan.py \
 
 This only prepares the isolated worktree and `builder-prompt.md`; it does not invent code changes or publish a PR. `run-builder-worker.py` and `publish-draft-pr.py` still own those gates.
 
+For status/design plans that reference an open PR stack or a deferred decision, decomposition routes to PR-status / PR-maintenance / decision packets instead of turning every markdown bullet into a fake build. Before any in-flight build/maintenance/decision proceeds, create its dedicated Discord thread:
+
+```bash
+python3 scripts/ensure-build-threads.py
+```
+
+Use `--dry-run` to preview missing task threads without creating Discord threads.
+
 ## Contract shaping
 
 Run:

@@ -32,6 +32,7 @@ run_builder_worker = load_script_module("run_builder_worker_script", "run-builde
 publish_draft_pr = load_script_module("publish_draft_pr_script", "publish-draft-pr.py")
 stall_detector = load_script_module("stall_detector_script", "stall-detector.py")
 render_dashboard = load_script_module("render_dashboard_script", "render-dashboard.py")
+ensure_build_threads = load_script_module("ensure_build_threads_script", "ensure-build-threads.py")
 
 
 def run_script(repo: Path, *args: str) -> subprocess.CompletedProcess:
@@ -1097,6 +1098,96 @@ class PlanAutomationTests(unittest.TestCase):
             repo_check = next(item for item in audit["checks"] if item["code"] == "R1")
             self.assertEqual(repo_check["status"], "PASS")
             self.assertEqual(audit["failed"], 0)
+
+    def test_upgrade_status_plan_decomposes_to_pr_stack_and_decision_actions(self):
+        source = """# Upgrade / Migration workflow — plan-fronted hybrid design
+
+## Status update — 2026-06-25 plan audit
+
+**Open review stack:** PR-B3 fan-out/coarse verify/writeback/reaper/template is #713 (`feat/upgrade-fanout-verify`, open and mergeable at audit time). Fan-out SPEND admission is #725, stacked on #713 and inert until the stack lands.
+
+**Deferred by user decision:** PR-B4 / H7 real empirical verify (`apply → install → build → test`) is deferred until after #713 and #725 merge. The sandbox/credential model remains the live design to revisit then.
+
+## 0. The shape in one paragraph
+- No approval-signal coordination seam. This is rationale, not a build packet.
+- Cleaner RLS posture. This is rationale, not a build packet.
+"""
+
+        packets = plan_automation_lib.split_pr_packets(source, "Upgrade / Migration workflow")
+
+        self.assertEqual([p["kind"] for p in packets], ["pr_status_wait", "pr_maintenance", "decision_required"])
+        by_pr = {p.get("pr_number"): p for p in packets if p.get("pr_number")}
+        self.assertEqual(by_pr[713]["status"], "waiting")
+        self.assertEqual(by_pr[725]["status"], "planned")
+        self.assertEqual(by_pr[725]["depends_on"], ["pr713-review"] )
+        self.assertTrue(by_pr[725]["discord"]["requires_dedicated_thread"])
+        self.assertIn("PR #725", by_pr[725]["discord"]["thread_title"])
+        decision = packets[2]
+        self.assertIn("PR-B4", decision["title"])
+        self.assertTrue(decision["awaiting_operator"])
+
+    def test_decompose_plan_marks_decisions_and_pr_handoffs_without_dispatching_design_rationale(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            plan_id = "plan-upgrade"
+            plan_dir = tmp_path / "plans" / plan_id
+            plan_dir.mkdir(parents=True)
+            (tmp_path / ".automation").mkdir()
+            source = """# Upgrade / Migration workflow
+
+**Open review stack:** PR-B3 fan-out is #713 (`feat/upgrade-fanout-verify`, open and mergeable at audit time). Fan-out SPEND admission is #725, stacked on #713 and inert until the stack lands.
+
+**Deferred by user decision:** PR-B4 / H7 real empirical verify is deferred until after #713 and #725 merge.
+
+- Design rationale bullet that must not become a PR packet.
+"""
+            (plan_dir / "source-plan.md").write_text(source, encoding="utf-8")
+            (plan_dir / "meta.json").write_text(json.dumps({
+                "plan_id": plan_id,
+                "title": "Upgrade / Migration workflow",
+                "state": "DECOMPOSE",
+                "repo": "/tmp/target",
+                "base_branch": "main",
+                "discord": {"thread_id": "plan-thread"},
+                "awaiting_operator": False,
+            }), encoding="utf-8")
+
+            result = plan_automation_lib.decompose_plan(tmp_path, plan_id)
+
+            self.assertEqual(result["packet_count"], 3)
+            tasks = {item["kind"]: item for item in result["tasks"]}
+            wait_meta = json.loads((Path(tasks["pr_status_wait"]["task_dir"]) / "meta.json").read_text(encoding="utf-8"))
+            maint_meta = json.loads((Path(tasks["pr_maintenance"]["task_dir"]) / "meta.json").read_text(encoding="utf-8"))
+            decision_meta = json.loads((Path(tasks["decision_required"]["task_dir"]) / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(wait_meta["state"], "PR_STATUS")
+            self.assertEqual(maint_meta["state"], "SHAPE")
+            self.assertTrue(maint_meta["discord"]["requires_dedicated_thread"])
+            self.assertEqual(decision_meta["state"], "QUESTION")
+            self.assertTrue(decision_meta["awaiting_operator"])
+            questions = (Path(tasks["decision_required"]["task_dir"]) / "questions.md").read_text(encoding="utf-8")
+            self.assertIn("Decision needed", questions)
+
+    def test_ensure_build_threads_dry_run_lists_each_in_flight_task_thread(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            task_dir = tmp_path / "tasks" / "task-pr725"
+            task_dir.mkdir(parents=True)
+            (task_dir / "meta.json").write_text(json.dumps({
+                "task_id": "task-pr725",
+                "state": "SHAPE",
+                "pr_packet": {"kind": "pr_maintenance", "title": "Update stacked PR #725"},
+                "discord": {
+                    "requires_dedicated_thread": True,
+                    "thread_title": "PR #725 — stacked maintenance",
+                    "prompt": "Inspect conflicts and run PR automation.",
+                },
+            }), encoding="utf-8")
+
+            result = ensure_build_threads.ensure_threads(tmp_path, channel_id="build-control", dry_run=True)
+
+            self.assertEqual(result["action_count"], 1)
+            self.assertEqual(result["actions"][0]["action"], "would_create_thread")
+            self.assertEqual(result["actions"][0]["title"], "PR #725 — stacked maintenance")
 
 
 if __name__ == "__main__":

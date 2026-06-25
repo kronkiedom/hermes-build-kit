@@ -44,7 +44,9 @@ Rules:
 - retired, superseded, or blocked source plans must fail closed unless the operator explicitly overrides
 - must not run a builder, publish a PR, or merge by itself
 
-Starter implementation: `scripts/ingest-source-plan.py` wraps intake, source-status audit, 5x5 audit, optional contract approval/decomposition, and optional dispatch worktree prep.
+Starter implementation: `scripts/ingest-source-plan.py` wraps intake, source-status audit, 5x5 audit, optional contract approval/decomposition, and optional dispatch worktree prep. Status/design plans with open PR stacks decompose into PR-status / PR-maintenance / decision packets rather than rationale bullets.
+
+Companion implementation: `scripts/ensure-build-threads.py` creates one dedicated Discord thread per in-flight build, PR-maintenance, or decision packet before execution continues.
 
 ### 2. Backlog discovery worker
 Discovers potential work and writes or updates backlog candidates.

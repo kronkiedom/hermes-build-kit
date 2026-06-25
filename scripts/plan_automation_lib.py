@@ -664,7 +664,102 @@ def ingest_source_plan(repo_root: Path, request: SourcePlanIngestRequest) -> dic
     return result
 
 
+def extract_status_plan_packets(source: str) -> list[dict[str, Any]]:
+    """Extract actionable PR-stack and decision packets from status/design plans.
+
+    Status plans often contain many rationale bullets. Turning every bullet into a
+    build packet is a facade: it dispatches design prose instead of real work.
+    This extractor recognizes the active work encoded in status sections and
+    routes it to PR-status, PR-maintenance, or decision prompts.
+    """
+    text = source
+    lower = text.lower()
+    if "open review stack" not in lower and "deferred by user decision" not in lower:
+        return []
+
+    packets: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(packet: dict[str, Any]) -> None:
+        key = str(packet.get("packet_id"))
+        if key not in seen:
+            seen.add(key)
+            packets.append(packet)
+
+    open_stack_lines = [line for line in text.splitlines() if "open review stack" in line.lower() or "stacked" in line.lower()]
+    stack_text = "\n".join(open_stack_lines) or text
+    pr_numbers: list[int] = []
+    for match in re.finditer(r"#(\d+)\b", stack_text):
+        number = int(match.group(1))
+        if number not in pr_numbers:
+            pr_numbers.append(number)
+
+    # PRs already in review are handed to PR-status rather than rebuilt. The first
+    # PR in an open stack is the base review item; later PRs are maintenance items.
+    base_packet_id = ""
+    if pr_numbers:
+        base_number = pr_numbers[0]
+        base_packet_id = f"pr{base_number}-review"
+        branch_match = re.search(r"`([^`]*fanout[^`]*)`|`([^`]*fan-out[^`]*)`|`([^`]+)`", stack_text, flags=re.IGNORECASE)
+        base_branch = next((group for group in (branch_match.groups() if branch_match else []) if group), f"pr-{base_number}")
+        add({
+            "kind": "pr_status_wait",
+            "packet_id": base_packet_id,
+            "title": f"Track PR #{base_number} review state until re-review clears",
+            "branch": base_branch,
+            "status": "waiting",
+            "pr_number": base_number,
+            "depends_on": [],
+            "handler": "pr_status_monitor",
+            "discord": {
+                "requires_dedicated_thread": True,
+                "thread_title": f"PR #{base_number} — review status",
+                "prompt": f"PR #{base_number} is in review. Wait for fresh reviewer signal; do not rebuild from plan prose.",
+            },
+        })
+
+    for number in pr_numbers[1:]:
+        add({
+            "kind": "pr_maintenance",
+            "packet_id": f"pr{number}-stacked-maintenance",
+            "title": f"Update stacked PR #{number} through PR automation",
+            "branch": f"pr-{number}",
+            "status": "planned",
+            "pr_number": number,
+            "depends_on": [base_packet_id] if base_packet_id else [],
+            "handler": "pr_status_monitor",
+            "discord": {
+                "requires_dedicated_thread": True,
+                "thread_title": f"PR #{number} — stacked maintenance",
+                "prompt": f"PR #{number} needs PR automation: inspect conflicts/rebase state, update the stacked branch only when authorized, run readiness, then hand off to PR-status.",
+            },
+        })
+
+    if "pr-b4" in lower or "h7" in lower or "empirical verify" in lower:
+        add({
+            "kind": "decision_required",
+            "packet_id": "decision-pr-b4-empirical-verify",
+            "title": "Decision needed: PR-B4 / H7 empirical verify sandbox",
+            "branch": "decision/pr-b4-empirical-verify",
+            "status": "blocked",
+            "depends_on": [key for key in ["pr713-review", "pr725-stacked-maintenance"] if key in seen],
+            "awaiting_operator": True,
+            "handler": "discord_decision_prompt",
+            "discord": {
+                "requires_dedicated_thread": True,
+                "thread_title": "Decision — PR-B4 empirical verify sandbox",
+                "prompt": "Decision needed: choose the PR-B4 / H7 empirical verify sandbox and credential model before build starts.",
+            },
+        })
+
+    return packets
+
+
 def split_pr_packets(source: str, title: str) -> list[dict[str, Any]]:
+    status_packets = extract_status_plan_packets(source)
+    if status_packets:
+        return status_packets
+
     bullets = [line.strip().lstrip("-*0123456789. ").strip() for line in source.splitlines() if line.lstrip().startswith(("- ", "* "))]
     if not bullets:
         bullets = [title]
@@ -672,11 +767,18 @@ def split_pr_packets(source: str, title: str) -> list[dict[str, Any]]:
     for idx, item in enumerate(bullets, start=1):
         slug = slugify(item, fallback=f"packet-{idx}")[:36]
         packets.append({
+            "kind": "build",
             "packet_id": f"pr{idx:02d}-{slug}",
             "title": item[:100],
             "branch": f"feat/{slug}",
             "status": "planned",
             "depends_on": [],
+            "handler": "build_control",
+            "discord": {
+                "requires_dedicated_thread": True,
+                "thread_title": f"Build — {item[:70]}",
+                "prompt": "Dedicated build thread required before execution starts.",
+            },
         })
     return packets
 
@@ -698,33 +800,56 @@ def decompose_plan(repo_root: Path, plan_id: str) -> dict[str, Any]:
         task_id = f"{plan_id}-{packet['packet_id']}"
         packet["task_id"] = task_id
         task_dir = repo_root / "tasks" / task_id
+        kind = str(packet.get("kind") or "build")
+        task_state = "SHAPE"
+        awaiting_operator = False
+        state_reason = "created from approved plan decomposition"
+        phase_status = {"SHAPE": "READY"}
+        if kind == "pr_status_wait":
+            task_state = "PR_STATUS"
+            state_reason = "existing PR is in review; PR-status automation owns the next event"
+            phase_status = {"PR_STATUS": "WAITING"}
+        elif kind == "decision_required":
+            task_state = "QUESTION"
+            awaiting_operator = True
+            state_reason = "decision prompt required before this build can start"
+            phase_status = {"DECISION": "NEEDS_OPERATOR"}
+
         task_meta = {
             "task_id": task_id,
             "source_plan_id": plan_id,
-            "state": "SHAPE",
-            "phase_status": {"SHAPE": "READY"},
+            "state": task_state,
+            "phase_status": phase_status,
             "operator_approvals": [],
             "escalations": [],
-            "awaiting_operator": False,
-            "state_reason": "created from approved plan decomposition",
+            "awaiting_operator": awaiting_operator,
+            "state_reason": state_reason,
             "created": now,
             "pr_packet": packet,
+            "discord": packet.get("discord", {}),
         }
         task_md = (
             f"# Task: {packet['title']}\n\n"
             f"- Source plan: `{plan_id}`\n"
+            f"- Kind: `{kind}`\n"
+            f"- Handler: `{packet.get('handler', 'build_control')}`\n"
+            f"- Dedicated Discord thread required: `{bool((packet.get('discord') or {}).get('requires_dedicated_thread'))}`\n"
             f"- Branch: `{packet['branch']}`\n"
             f"- Target repo: `{meta.get('repo')}`\n"
             f"- Base branch: `{meta.get('base_branch')}`\n\n"
             "## Done means\n"
-            "- Implement this packet only.\n"
-            "- Open a draft PR or record why PR creation is blocked.\n"
-            "- Persist summary, verification, and evidence artifacts.\n"
         )
+        if kind == "pr_status_wait":
+            task_md += "- PR-status monitor records the next review/check event.\n- No rebuild starts from design prose.\n"
+        elif kind == "decision_required":
+            task_md += "- Operator answers the decision prompt in this task's dedicated thread.\n- Build remains blocked until a durable decision is recorded.\n"
+            write_text(task_dir / "questions.md", f"# Decision needed\n\n{(packet.get('discord') or {}).get('prompt', packet['title'])}\n")
+        else:
+            task_md += "- Implement this packet only.\n- Open a draft PR or record why PR creation is blocked.\n- Persist summary, verification, and evidence artifacts.\n"
         write_json(task_dir / "meta.json", task_meta)
         write_text(task_dir / "task.md", task_md)
-        write_text(task_dir / "checkpoints.md", f"# checkpoints\n\n- {now} — created from plan decomposition `{plan_id}`\n")
-        tasks.append({"task_id": task_id, "task_dir": str(task_dir), "branch": packet["branch"]})
+        write_text(task_dir / "checkpoints.md", f"# checkpoints\n\n- {now} — created from plan decomposition `{plan_id}` ({kind})\n")
+        tasks.append({"task_id": task_id, "task_dir": str(task_dir), "branch": packet["branch"], "kind": kind})
 
     prs = {"plan_id": plan_id, "packets": packets, "updated_at": now}
     write_json(plan_dir / "prs.json", prs)
