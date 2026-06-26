@@ -1108,6 +1108,20 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertEqual(repo_check["status"], "PASS")
             self.assertEqual(audit["failed"], 0)
 
+    def test_source_plan_status_treats_not_yet_implemented_plan_as_active(self):
+        markdown = """# Chat-card terminal-status fix + async acceptance-criteria generation
+
+**Status:** PLAN — not yet implemented. No code written. tsc/tests **NOT RUN** (no diff yet).
+
+## Status update — 2026-06-25 plan audit
+**Async criteria generation:** approved to build now.
+"""
+
+        audit = plan_automation_lib.audit_source_plan_status(markdown, source_path="plan.md")
+
+        self.assertEqual(audit["status"], "ACTIVE")
+        self.assertEqual(audit["blockers"], [])
+
     def test_upgrade_status_plan_decomposes_to_pr_stack_and_decision_actions(self):
         source = """# Upgrade / Migration workflow — plan-fronted hybrid design
 

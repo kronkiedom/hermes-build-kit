@@ -404,6 +404,8 @@ def audit_source_plan_status(markdown: str, *, source_path: str | None = None) -
         if "decision checkpoint" in lower or "decision needed" in lower:
             add_basis("decision-marker", idx, line.strip())
 
+    status_text = "\n".join(str(item.get("text") or "") for item in basis if item.get("code") == "status-line")
+
     status = "UNKNOWN"
     if any(item["code"] == "retired-marker" for item in basis) or "retained as historical" in scan:
         status = "RETIRED"
@@ -412,7 +414,7 @@ def audit_source_plan_status(markdown: str, *, source_path: str | None = None) -
             "severity": "P1",
             "message": "source plan is marked retired/historical; execution is INVALID-WITHOUT operator override or a current active plan pointer",
         })
-    elif re.search(r"status\s*[:*`_ -]+.*\b(blocked|cancelled|canceled|superseded)\b", scan):
+    elif re.search(r"\b(blocked|cancelled|canceled|superseded)\b", status_text, re.IGNORECASE):
         status = "BLOCKED"
         blockers.append({
             "kind": "blocked_source_plan",
@@ -420,8 +422,9 @@ def audit_source_plan_status(markdown: str, *, source_path: str | None = None) -
             "message": "source plan status indicates blocked/superseded/cancelled; execution must fail-closed before build dispatch",
         })
     elif (
-        re.search(r"status\s*[:*`_ -]+.*\b(active|ready|not yet started|build next|not started|authoritative current design|current design|source of truth)\b", scan)
+        re.search(r"\b(active|ready|not yet implemented|not yet started|build next|not started|authoritative current design|current design|source of truth|plan)\b", status_text, re.IGNORECASE)
         or "remains active" in scan
+        or "approved to build now" in scan
         or "done means" in scan
         or "acceptance" in scan
     ):
