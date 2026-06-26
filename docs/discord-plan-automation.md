@@ -74,7 +74,7 @@ For status/design plans that reference an open PR stack or a deferred decision, 
 python3 scripts/ensure-build-threads.py
 ```
 
-Use `--dry-run` to preview missing task threads without creating Discord threads.
+Use `--dry-run` to preview missing task threads without creating Discord threads. Thread openers are persistent task cards: they include what the task is, where it is, what must happen to complete it, and the decision question when the task is waiting on the operator. The worker also adds the configured operator as a thread member when Discord permits it.
 
 ## Contract shaping
 
@@ -181,7 +181,9 @@ Because the PR status monitor intentionally searches only open PRs, `scripts/rec
 
 `scripts/open-plan-router.py` classifies each open plan into the next safe handler/action. It makes stalled-looking `CONTRACT` plans explicit (`shape_contract`, `agent_required`) and routes `EXECUTING` plans to `scripts/dispatch-pr-worker.py` when the dispatcher exists.
 
-`scripts/discord-plan-thread-poller.py` ingests operator replies from active plan threads. Replies to `QUESTION` plans are appended to `operator-replies.jsonl` and move the plan back to `CONTRACT` for reshaping. `approve` / `reject` / `cancel` replies to `CONTRACT_REVIEW` are recorded in `approvals.json`; approval moves the plan to `DECOMPOSE`.
+`scripts/open-plan-status-monitor.py` keeps each active plan thread grounded with a persistent plan card. The card is posted once and then edited as state changes; it summarizes the plan, where it is, what must happen to complete it, and any decision/reply needed. It also adds the operator as a thread member when possible so bot-created threads are visible in Discord.
+
+`scripts/discord-plan-thread-poller.py` polls active plan threads for operator replies. Replies in `QUESTION` move the plan back to `CONTRACT`; replies in `CONTRACT_REVIEW` can approve/reject/cancel the contract. The same poller also watches child task/decision threads: an operator reply is recorded into task metadata, clears `awaiting_operator`, and moves decision tasks out of `QUESTION` so build-control can continue routing.
 
 ## Open plan status monitor
 

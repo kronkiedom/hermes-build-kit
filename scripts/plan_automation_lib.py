@@ -97,6 +97,27 @@ def post_discord_json(token: str, path: str, payload: dict[str, Any]) -> dict[st
         raise RuntimeError(f"Discord API POST {path} failed: {exc.code} {body}") from exc
 
 
+def put_discord_json(token: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"https://discord.com/api/v10{path}",
+        data=data,
+        headers={
+            "Authorization": f"Bot {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "Hermes plan automation",
+        },
+        method="PUT",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as response:
+            raw = response.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "ignore")
+        raise RuntimeError(f"Discord API PUT {path} failed: {exc.code} {body}") from exc
+
+
 def create_discord_thread(token: str, channel_id: str, title: str, message: str) -> tuple[str, str | None]:
     """Create a public thread with an opener message.
 
@@ -136,13 +157,23 @@ def create_plan_intake(repo_root: Path, request: IntakeRequest) -> dict[str, Any
         if not request.discord_token:
             raise ValueError("Discord token is required unless --no-discord or --thread-id is supplied")
         starter = (
-            f"Build plan accepted: **{title}**\n"
-            f"Plan ID: `{plan_id}`\n"
-            "I will shape this into a contract before any PR work starts."
+            f"**Persistent plan card**\n"
+            f"**Plan:** {title}\n"
+            f"**Plan ID:** `{plan_id}`\n"
+            f"**State:** `CONTRACT` (`IN_PROGRESS`)\n"
+            f"**Where it is:** intake accepted; ready for contract shaping\n"
+            f"**Needs to complete:** shape contract, approve scope, decompose into build/decision packets, verify, and hand off PRs.\n"
+            f"**Repo/base:** `{request.repo}` / `{request.base_branch}`\n\n"
+            "Reply in this thread to progress the workflow. If a decision is requested, answer it here; `approve` approves a contract review."
         )
         thread_id, starter_message_id = create_discord_thread(
             request.discord_token, request.control_channel_id, thread_title, starter
         )
+        if request.operator_user_id:
+            try:
+                put_discord_json(request.discord_token, f"/channels/{thread_id}/thread-members/{request.operator_user_id}")
+            except Exception:
+                pass
 
     if not thread_id:
         raise ValueError("thread_id is required in --no-discord mode")
@@ -161,6 +192,7 @@ def create_plan_intake(repo_root: Path, request: IntakeRequest) -> dict[str, Any
             "control_channel_id": request.control_channel_id,
             "thread_id": thread_id,
             "starter_message_id": starter_message_id,
+            "plan_card_message_id": starter_message_id,
             "operator_user_id": request.operator_user_id,
         },
     }

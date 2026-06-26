@@ -72,6 +72,28 @@ def active_thread_plans(repo_root: Path) -> list[dict[str, Any]]:
     return out
 
 
+def active_thread_tasks(repo_root: Path) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for meta_path in sorted((repo_root / "tasks").glob("*/meta.json")):
+        meta = read_json(meta_path, {})
+        if not isinstance(meta, dict):
+            continue
+        state = str(meta.get("state") or "")
+        if state in {"DONE", "CANCELLED"}:
+            continue
+        discord_raw = meta.get("discord")
+        discord: dict[str, Any] = discord_raw if isinstance(discord_raw, dict) else {}
+        thread_id = str(discord.get("thread_id") or "")
+        if not thread_id:
+            continue
+        # Poll every operator-waiting task thread, plus explicit decision-required packets.
+        packet = meta.get("pr_packet") if isinstance(meta.get("pr_packet"), dict) else {}
+        if not meta.get("awaiting_operator") and packet.get("kind") != "decision_required":
+            continue
+        out.append({**meta, "task_dir": str(meta_path.parent), "thread_id": thread_id})
+    return out
+
+
 def append_reply(plan_dir: Path, reply: dict[str, Any]) -> None:
     path = plan_dir / "operator-replies.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -128,36 +150,70 @@ def handle_operator_reply(repo_root: Path, plan: dict[str, Any], message: dict[s
     return {"action": "operator_reply_recorded", "plan_id": plan_id}
 
 
+def append_task_reply(task_dir: Path, reply: dict[str, Any]) -> None:
+    path = task_dir / "operator-replies.jsonl"
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(reply, sort_keys=True) + "\n")
+
+
+def handle_operator_task_reply(repo_root: Path, task: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
+    task_id = str(task.get("task_id") or "")
+    task_dir = Path(str(task.get("task_dir")))
+    content = str(message.get("content") or "")
+    reply = {
+        "message_id": str(message.get("id")),
+        "author_id": str((message.get("author") or {}).get("id") or ""),
+        "content": content,
+        "created_at": message.get("timestamp") or utc_now(),
+        "ingested_at": utc_now(),
+    }
+    append_task_reply(task_dir, reply)
+    meta_path = task_dir / "meta.json"
+    meta = read_json(meta_path, {})
+    if not isinstance(meta, dict):
+        return {"action": "operator_task_reply_recorded", "task_id": task_id}
+    meta["operator_decision"] = reply
+    meta["awaiting_operator"] = False
+    meta["decision_answered_at"] = reply["ingested_at"]
+    if str(meta.get("state")) == "QUESTION":
+        meta["state"] = "SHAPE"
+    meta["state_reason"] = "operator reply ingested from task thread; ready for next build-control action"
+    meta["updated_at"] = utc_now()
+    write_json(meta_path, meta)
+    return {"action": "operator_task_reply_ingested", "task_id": task_id, "next_state": meta.get("state")}
+
+
 def poll_plan_threads(repo_root: Path, *, operator_user_id: str, token: str, dry_run: bool = False) -> dict[str, Any]:
     state_path = repo_root / ".automation" / "discord-plan-thread-poller-state.json"
-    state = read_json(state_path, {"plans": {}})
+    state = read_json(state_path, {"plans": {}, "tasks": {}})
     state.setdefault("plans", {})
+    state.setdefault("tasks", {})
     actions = []
     checked = 0
-    for plan in active_thread_plans(repo_root):
-        plan_id = str(plan.get("plan_id"))
-        thread_id = str(plan.get("thread_id"))
-        plan_state = state["plans"].setdefault(plan_id, {})
+
+    def poll_target(kind: str, target_id: str, thread_id: str, state_bucket: dict[str, Any], handler) -> None:
+        nonlocal checked
+        target_state = state_bucket.setdefault(target_id, {})
         query = {"limit": 50}
-        if plan_state.get("last_message_id"):
-            query["after"] = plan_state["last_message_id"]
+        if target_state.get("last_message_id"):
+            query["after"] = target_state["last_message_id"]
         if dry_run:
-            actions.append({"action": "would_poll_plan_thread", "plan_id": plan_id, "thread_id": thread_id})
-            continue
+            actions.append({"action": f"would_poll_{kind}_thread", "id": target_id, "thread_id": thread_id})
+            return
         messages = request_json(token, f"/channels/{thread_id}/messages?{urllib.parse.urlencode(query)}")
         if not isinstance(messages, list):
             messages = []
         messages = sorted(messages, key=lambda item: int(item.get("id", 0)))
-        if not plan_state.get("last_message_id") and not plan_state.get("initialized_at"):
+        if not target_state.get("last_message_id") and not target_state.get("initialized_at"):
             if messages:
-                plan_state["last_message_id"] = str(messages[-1].get("id"))
-            plan_state["initialized_at"] = utc_now()
-            actions.append({"action": "initialized_plan_thread_cursor", "plan_id": plan_id, "thread_id": thread_id})
-            continue
+                target_state["last_message_id"] = str(messages[-1].get("id"))
+            target_state["initialized_at"] = utc_now()
+            actions.append({"action": f"initialized_{kind}_thread_cursor", "id": target_id, "thread_id": thread_id})
+            return
         for message in messages:
             checked += 1
             message_id = str(message.get("id"))
-            plan_state["last_message_id"] = message_id
+            target_state["last_message_id"] = message_id
             author_id = str((message.get("author") or {}).get("id") or "")
             if author_id != operator_user_id:
                 continue
@@ -165,9 +221,32 @@ def poll_plan_threads(repo_root: Path, *, operator_user_id: str, token: str, dry
             if not content:
                 continue
             if dry_run:
-                actions.append({"action": "would_ingest_operator_reply", "plan_id": plan_id, "message_id": message_id})
+                actions.append({"action": f"would_ingest_operator_{kind}_reply", "id": target_id, "message_id": message_id})
             else:
-                actions.append(handle_operator_reply(repo_root, plan, message))
+                actions.append(handler(message))
+
+    for plan in active_thread_plans(repo_root):
+        plan_id = str(plan.get("plan_id"))
+        thread_id = str(plan.get("thread_id"))
+        poll_target(
+            "plan",
+            plan_id,
+            thread_id,
+            state["plans"],
+            lambda message, plan=plan: handle_operator_reply(repo_root, plan, message),
+        )
+
+    for task in active_thread_tasks(repo_root):
+        task_id = str(task.get("task_id"))
+        thread_id = str(task.get("thread_id"))
+        poll_target(
+            "task",
+            task_id,
+            thread_id,
+            state["tasks"],
+            lambda message, task=task: handle_operator_task_reply(repo_root, task, message),
+        )
+
     state["updated_at"] = utc_now()
     if not dry_run:
         write_json(state_path, state)

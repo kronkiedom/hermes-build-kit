@@ -57,6 +57,15 @@ def post_message(token: str, channel_id: str, content: str) -> str:
     return str(message["id"])
 
 
+def update_message(token: str, channel_id: str, message_id: str, content: str) -> str:
+    message = discord_request(token, f"/channels/{channel_id}/messages/{message_id}", method="PATCH", payload={"content": content[:1900]})
+    return str(message["id"])
+
+
+def add_thread_member(token: str, thread_id: str, user_id: str) -> None:
+    discord_request(token, f"/channels/{thread_id}/thread-members/{user_id}", method="PUT", payload={})
+
+
 def archive_thread(token: str, thread_id: str) -> None:
     # Discord closes a thread by archiving it. Locking keeps completed/cancelled
     # plan threads from being revived as stale action surfaces.
@@ -79,6 +88,7 @@ def classify_plan(plan: dict[str, Any]) -> dict[str, Any]:
     awaiting_operator = bool(plan.get("awaiting_operator")) or state in OPERATOR_WAIT_STATES
     terminal = state in TERMINAL_PLAN_STATES
     thread_id = str((plan.get("discord") or {}).get("thread_id") or plan.get("thread_id") or "")
+    plan_card_message_id = str((plan.get("discord") or {}).get("plan_card_message_id") or plan.get("plan_card_message_id") or "")
     status = "TERMINAL" if terminal else ("OPERATOR_WAITING" if awaiting_operator else "IN_PROGRESS")
     return {
         "plan_id": plan.get("plan_id"),
@@ -88,6 +98,7 @@ def classify_plan(plan: dict[str, Any]) -> dict[str, Any]:
         "awaiting_operator": awaiting_operator,
         "terminal": terminal,
         "thread_id": thread_id,
+        "plan_card_message_id": plan_card_message_id,
         "reason": plan.get("state_reason") or "",
         "updated_at": plan.get("updated_at"),
         "repo": plan.get("repo"),
@@ -113,6 +124,58 @@ def format_operator_alert(status: dict[str, Any], operator_user_id: str) -> str:
         f"- reason: {status.get('reason') or 'awaiting operator decision'}\n\n"
         "Reply in this thread with the requested decision/input."
     )[:1900]
+
+
+def format_plan_card(status: dict[str, Any], operator_user_id: str) -> str:
+    title = status.get('title') or status.get('plan_id')
+    state = str(status.get('state') or 'UNKNOWN')
+    reason = status.get('reason') or 'No current blocker recorded.'
+    needs = reason
+    if status.get('awaiting_operator'):
+        needs = "Operator response in this thread."
+    elif state == 'CONTRACT':
+        needs = "Contract shaping/re-shaping by build-control."
+    elif state == 'CONTRACT_REVIEW':
+        needs = "Operator approval (`approve`) or requested changes in this thread."
+    elif state == 'DECOMPOSE':
+        needs = "Run decomposition into PR/build packets."
+    elif state == 'EXECUTING':
+        needs = "Continue child build/decision packets until all are terminal."
+    question = ""
+    if status.get('awaiting_operator') or state in {'QUESTION', 'CONTRACT_REVIEW'}:
+        question = f"\n**Decision / reply needed:** <@{operator_user_id}> {needs}"
+    return (
+        f"**Persistent plan card**\n"
+        f"**Plan:** {title}\n"
+        f"**Plan ID:** `{status.get('plan_id')}`\n"
+        f"**State:** `{state}` (`{status.get('status')}`)\n"
+        f"**Where it is:** {reason}\n"
+        f"**Needs to complete:** {needs}\n"
+        f"**Repo/base:** `{status.get('repo') or 'unknown'}` / `{status.get('base_branch') or 'main'}`"
+        f"{question}\n\n"
+        "Reply in this thread to progress the workflow. `approve` approves a contract; otherwise your reply is recorded and moves waiting plans back to contract shaping."
+    )[:1900]
+
+
+def ensure_plan_card(token: str, status: dict[str, Any], entry: dict[str, Any], operator_user_id: str, *, dry_run: bool = False) -> dict[str, Any]:
+    thread_id = str(status.get('thread_id') or entry.get('thread_id') or '')
+    if not thread_id:
+        return {"action": "plan_card_no_thread", "plan_id": status.get('plan_id')}
+    content = format_plan_card(status, operator_user_id)
+    card_id = str(entry.get('plan_card_message_id') or status.get('plan_card_message_id') or '')
+    if dry_run:
+        return {"action": "would_update_plan_card" if card_id else "would_create_plan_card", "plan_id": status.get('plan_id'), "thread_id": thread_id, "message_id": card_id or None}
+    if card_id:
+        try:
+            update_message(token, thread_id, card_id, content)
+            return {"action": "updated_plan_card", "plan_id": status.get('plan_id'), "thread_id": thread_id, "message_id": card_id}
+        except Exception:
+            # If the recorded message vanished, recreate the card below.
+            card_id = ""
+    message_id = post_message(token, thread_id, content)
+    entry['plan_card_message_id'] = message_id
+    entry['thread_id'] = thread_id
+    return {"action": "created_plan_card", "plan_id": status.get('plan_id'), "thread_id": thread_id, "message_id": message_id}
 
 
 def format_terminal_message(status: dict[str, Any]) -> str:
@@ -156,6 +219,15 @@ def sync_open_plan_threads(
         if thread_id:
             entry["thread_id"] = thread_id
         fingerprint = plan_fingerprint(status)
+        if thread_id and not status.get("terminal"):
+            if not dry_run:
+                try:
+                    add_thread_member(token, str(thread_id), operator_user_id)
+                except Exception:
+                    # Visibility is best-effort; the card/update below still links the thread.
+                    pass
+            card_action = ensure_plan_card(token, status, entry, operator_user_id, dry_run=dry_run)
+            actions.append(card_action)
         active = entry.get("active_alert") if isinstance(entry.get("active_alert"), dict) else None
 
         if status.get("terminal"):
@@ -165,10 +237,15 @@ def sync_open_plan_threads(
                 actions.append({"action": "would_close_plan_thread", "plan_id": plan_id, "thread_id": thread_id})
             else:
                 if thread_id:
-                    post_message(token, thread_id, format_terminal_message(status))
-                    archive_thread(token, thread_id)
-                    entry["thread_archived_at"] = utc_now()
-                    actions.append({"action": "closed_plan_thread", "plan_id": plan_id, "thread_id": thread_id})
+                    try:
+                        post_message(token, thread_id, format_terminal_message(status))
+                        archive_thread(token, thread_id)
+                        entry["thread_archived_at"] = utc_now()
+                        actions.append({"action": "closed_plan_thread", "plan_id": plan_id, "thread_id": thread_id})
+                    except Exception as exc:
+                        entry["thread_archive_error"] = str(exc)[:500]
+                        entry["thread_archived_at"] = entry.get("thread_archived_at") or utc_now()
+                        actions.append({"action": "close_plan_thread_failed", "plan_id": plan_id, "thread_id": thread_id, "error": str(exc)[:200]})
                 else:
                     actions.append({"action": "terminal_no_thread", "plan_id": plan_id})
             if active:

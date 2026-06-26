@@ -855,8 +855,9 @@ class PlanAutomationTests(unittest.TestCase):
 
             self.assertIn("alerted_plan_thread", {a["action"] for a in first["actions"]})
             self.assertIn("suppressed_plan_alert_pending", {a["action"] for a in second["actions"]})
-            self.assertEqual(len(sent), 1)
-            self.assertIn("<@op>", sent[0][1])
+            self.assertEqual(len([item for item in sent if "needs operator input" in item[1]]), 1)
+            self.assertTrue(any("Persistent plan card" in item[1] for item in sent))
+            self.assertTrue(any("<@op>" in item[1] for item in sent))
             ledger = json.loads((tmp_path / ".automation" / "plan-status-ledger.json").read_text(encoding="utf-8"))
             self.assertEqual(ledger["plans"][plan_id]["active_alert"]["state"], "OPERATOR_PENDING")
 
@@ -1353,6 +1354,7 @@ class PlanAutomationTests(unittest.TestCase):
             (task_dir / "meta.json").write_text(json.dumps({
                 "task_id": "task-pr725",
                 "state": "SHAPE",
+                "source_plan_id": "plan-upgrade",
                 "pr_packet": {"kind": "pr_maintenance", "title": "Update stacked PR #725"},
                 "discord": {
                     "requires_dedicated_thread": True,
@@ -1362,10 +1364,84 @@ class PlanAutomationTests(unittest.TestCase):
             }), encoding="utf-8")
 
             result = ensure_build_threads.ensure_threads(tmp_path, channel_id="build-control", dry_run=True)
+            meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
+            opener = ensure_build_threads.starter_message(meta)
 
             self.assertEqual(result["action_count"], 1)
             self.assertEqual(result["actions"][0]["action"], "would_create_thread")
             self.assertEqual(result["actions"][0]["title"], "PR #725 — stacked maintenance")
+            self.assertIn("Persistent task card", opener)
+            self.assertIn("Needs to complete", opener)
+            self.assertIn("Reply in this thread to progress", opener)
+
+    def test_open_plan_status_posts_then_updates_persistent_plan_card(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            plan_id = "plan-card"
+            plan_dir = tmp_path / "plans" / plan_id
+            plan_dir.mkdir(parents=True)
+            (tmp_path / ".automation").mkdir()
+            meta = {
+                "plan_id": plan_id,
+                "title": "Card plan",
+                "state": "CONTRACT_REVIEW",
+                "awaiting_operator": True,
+                "state_reason": "contract shaped; awaiting approval",
+                "updated_at": "2026-06-25T00:00:00+00:00",
+                "repo": "/repo",
+                "base_branch": "main",
+                "discord": {"thread_id": "thread-card"},
+            }
+            (plan_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+            (tmp_path / ".automation" / "plans-index.json").write_text(json.dumps({
+                "plans": {plan_id: {"plan_id": plan_id, "plan_dir": str(plan_dir), "thread_id": "thread-card", "state": "CONTRACT_REVIEW"}},
+            }), encoding="utf-8")
+            sent = []
+            updated = []
+            old_post, old_update, old_member = plan_status_lib.post_message, plan_status_lib.update_message, plan_status_lib.add_thread_member
+            try:
+                plan_status_lib.post_message = lambda token, channel_id, content: sent.append((channel_id, content)) or "card-msg"
+                plan_status_lib.update_message = lambda token, channel_id, message_id, content: updated.append((channel_id, message_id, content)) or message_id
+                plan_status_lib.add_thread_member = lambda token, thread_id, user_id: None
+                first = sync_open_plan_threads(tmp_path, operator_user_id="op", token="tok")
+                second = sync_open_plan_threads(tmp_path, operator_user_id="op", token="tok")
+            finally:
+                plan_status_lib.post_message, plan_status_lib.update_message, plan_status_lib.add_thread_member = old_post, old_update, old_member
+
+            self.assertIn("created_plan_card", {a["action"] for a in first["actions"]})
+            self.assertIn("updated_plan_card", {a["action"] for a in second["actions"]})
+            self.assertTrue(any("Persistent plan card" in item[1] and "Decision / reply needed" in item[1] for item in sent))
+            self.assertEqual(updated[0][1], "card-msg")
+            ledger = json.loads((tmp_path / ".automation" / "plan-status-ledger.json").read_text(encoding="utf-8"))
+            self.assertEqual(ledger["plans"][plan_id]["plan_card_message_id"], "card-msg")
+
+    def test_task_thread_reply_unblocks_decision_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            task_dir = tmp_path / "tasks" / "task-decision"
+            task_dir.mkdir(parents=True)
+            (task_dir / "meta.json").write_text(json.dumps({
+                "task_id": "task-decision",
+                "state": "QUESTION",
+                "awaiting_operator": True,
+                "pr_packet": {"kind": "decision_required", "packet_id": "decision-1"},
+                "discord": {"thread_id": "thread-decision"},
+            }), encoding="utf-8")
+
+            result = plan_thread_poller.handle_operator_task_reply(tmp_path, {"task_id": "task-decision", "task_dir": str(task_dir)}, {
+                "id": "msg-1",
+                "content": "Use public digest-pinned image and rootless podman.",
+                "author": {"id": "op"},
+                "timestamp": "2026-06-26T00:00:00+00:00",
+            })
+
+            self.assertEqual(result["action"], "operator_task_reply_ingested")
+            meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["state"], "SHAPE")
+            self.assertFalse(meta["awaiting_operator"])
+            self.assertIn("operator_decision", meta)
+            replies = (task_dir / "operator-replies.jsonl").read_text(encoding="utf-8")
+            self.assertIn("rootless podman", replies)
 
 
 if __name__ == "__main__":
