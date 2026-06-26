@@ -34,7 +34,21 @@ Stores:
 
 ## Worker model
 
-### 1. Backlog discovery worker
+### 1. Existing-plan ingestion worker
+Consumes an already-authored markdown plan file and makes it visible to build-control.
+
+Rules:
+- must copy the source plan into durable `plans/<plan-id>/source-plan.md`
+- must audit current source-plan status before shaping/decomposition
+- must write a source-status audit and a 5x5 ingest audit before any execution state change
+- retired, superseded, or blocked source plans must fail closed unless the operator explicitly overrides
+- must not run a builder, publish a PR, or merge by itself
+
+Starter implementation: `scripts/ingest-source-plan.py` wraps intake, source-status audit, 5x5 audit, optional contract approval/decomposition, and optional dispatch worktree prep. Status/design plans with open PR stacks decompose into PR-status / PR-maintenance / decision packets rather than rationale bullets.
+
+Companion implementation: `scripts/ensure-build-threads.py` creates one dedicated Discord thread per in-flight build, PR-maintenance, or decision packet before execution continues.
+
+### 2. Backlog discovery worker
 Discovers potential work and writes or updates backlog candidates.
 
 Rules:
@@ -42,7 +56,7 @@ Rules:
 - must not auto-admit execution work
 - should update a durable queue/index
 
-### 2. Soft-prep worker
+### 3. Soft-prep worker
 When execution is idle, prepares the next likely candidate for operator review.
 
 Rules:
@@ -50,7 +64,7 @@ Rules:
 - does not create real execution tasks
 - outputs a durable prep artifact
 
-### 3. Prep-admission worker
+### 4. Prep-admission worker
 Consumes an explicit operator acknowledgement of a prepared candidate and converts it into a real task.
 
 Rules:
@@ -59,7 +73,7 @@ Rules:
 - enters `SHAPE`
 - does not bypass pipeline gates
 
-### 4. Auto-dispatch worker
+### 5. Auto-dispatch worker
 Moves a task forward only when the current machine state permits it.
 
 Rules:
@@ -67,7 +81,7 @@ Rules:
 - must honor awaiting-operator states
 - should record dispatch history durably
 
-### 5. Discovery governor
+### 6. Discovery governor
 Pauses or resumes discovery based on queue pressure.
 
 Portable default policy:
@@ -75,7 +89,7 @@ Portable default policy:
 - resume at a lower watermark
 - stop or quiet after repeated empty passes
 
-### 6. Dashboard/status renderer
+### 7. Dashboard/status renderer
 Builds human-readable and machine-readable status from durable artifacts.
 
 Outputs commonly include:
@@ -83,8 +97,10 @@ Outputs commonly include:
 - `dashboard.json`
 - last-worker-result ledgers
 
-### 7. Stall detector
+### 8. Stall detector
 Flags tasks or workers that appear stuck.
+
+Starter implementation: `scripts/stall-detector.py` scans active task metadata and `.automation/status/*-last.json` worker ledgers. It writes `.automation/status/stall-detector-last.json` with `decision: CLEAR|STALLS_FOUND` and a list of stale tasks/workers. The default threshold is 24 hours and can be overridden with `--stale-hours`.
 
 ## Suggested default policy
 - one active task at a time

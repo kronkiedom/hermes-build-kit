@@ -26,6 +26,15 @@ def main():
     task_meta = list(tasks_root.glob("*/meta.json")) if tasks_root.exists() else []
     backlog_candidates = list(backlog_root.glob("candidate-*.md")) if backlog_root.exists() else []
     prep_candidates = list(prep_root.glob("*.md")) if prep_root.exists() else []
+    plans_index_path = automation_root / "plans-index.json"
+    if plans_index_path.exists():
+        try:
+            plans_index = json.loads(plans_index_path.read_text())
+            plan_count = len(plans_index.get("plans", {}))
+        except Exception:
+            plan_count = -1
+    else:
+        plan_count = 0
 
     now = datetime.now(timezone.utc).isoformat()
     write_json(status_root / "backlog-discovery-last.json", {
@@ -51,6 +60,7 @@ def main():
         "task_count": len(task_meta),
         "backlog_candidate_count": len(backlog_candidates),
         "prepared_count": len(prep_candidates),
+        "plan_count": plan_count,
     }, indent=2))
 
 
