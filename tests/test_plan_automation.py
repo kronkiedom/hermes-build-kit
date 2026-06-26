@@ -1759,7 +1759,8 @@ class PlanAutomationTests(unittest.TestCase):
                 "workflow_map": [
                     {"label": "PR #713", "title": "review status", "state": "DONE", "owner": "completed", "pr_url": "https://example/pr/713"},
                     {"label": "PR #725", "title": "stacked maintenance", "state": "DONE", "owner": "completed", "pr_url": "https://example/pr/725"},
-                    {"label": "decision-pr-b4", "title": "Build PR-B4 / H7 empirical verify sandbox", "state": "DISPATCHED", "owner": "build-control", "branch": "decision/pr-b4-empirical-verify"},
+                    {"label": "decision-pr-b4", "title": "Build PR-B4 / H7 empirical verify sandbox", "state": "VERIFYING", "owner": "build-control", "branch": "decision/pr-b4-empirical-verify"},
+                    {"label": "PR-B5", "title": "Remaining planned compatibility PR", "state": "SHAPE", "owner": "build-control", "branch": "feat/pr-b5"},
                 ],
                 "hidden_cancelled_count": 68,
             },
@@ -1767,12 +1768,35 @@ class PlanAutomationTests(unittest.TestCase):
 
         card = plan_status_lib.format_plan_card(status, "op")
 
-        self.assertIn("Contained workflow / PR map", card)
+        self.assertIn("Contained workflow / PR progress", card)
+        self.assertIn("✅ 2 complete", card)
+        self.assertIn("▶️ 1 in progress", card)
+        self.assertIn("🧭 1 planned/left to build", card)
         self.assertIn("PR #713", card)
         self.assertIn("PR #725", card)
         self.assertIn("decision-pr-b4", card)
+        self.assertIn("[in-progress] decision-pr-b4", card)
+        self.assertIn("[planned] PR-B5", card)
         self.assertIn("owner: `build-control`", card)
         self.assertIn("68 superseded/cancelled", card)
+
+    def test_plan_card_renders_pre_decomposition_progress_placeholder(self):
+        status = {
+            "plan_id": "plan-contract",
+            "title": "Contract plan",
+            "state": "CONTRACT_REVIEW",
+            "status": "OPERATOR_WAITING",
+            "reason": "awaiting approval",
+            "repo": "/repo",
+            "base_branch": "main",
+            "child_progress": {},
+        }
+
+        card = plan_status_lib.format_plan_card(status, "op")
+
+        self.assertIn("Contained workflow / PR progress", card)
+        self.assertIn("no PR/build packets decomposed yet", card)
+        self.assertIn("Remaining planned PRs will appear", card)
 
     def test_ensure_build_threads_skips_parent_contained_task(self):
         with tempfile.TemporaryDirectory() as td:

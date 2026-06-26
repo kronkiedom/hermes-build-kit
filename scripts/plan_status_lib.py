@@ -127,20 +127,51 @@ def format_operator_alert(status: dict[str, Any], operator_user_id: str) -> str:
     )[:1900]
 
 
-def workflow_icon(row: dict[str, Any]) -> str:
-    state = str(row.get("state") or "")
+def workflow_bucket(row: dict[str, Any]) -> str:
+    state = str(row.get("state") or "UNKNOWN")
     owner = str(row.get("owner") or "")
-    if state == "DONE":
-        return "✅"
+    if state == "DONE" or owner == "completed":
+        return "completed"
+    if state in {"CANCELLED", "parked"} or owner == "closed/superseded":
+        return "closed"
     if owner == "operator":
-        return "❓"
+        return "waiting"
     if owner == "pr-status":
+        return "pr-status"
+    if state in {"SHAPE", "READY", "READY_FOR_BUILDER", "DISPATCHED", "QUEUED", "PLANNED"}:
+        return "planned"
+    return "in-progress"
+
+
+def workflow_icon(row: dict[str, Any]) -> str:
+    bucket = workflow_bucket(row)
+    if bucket == "completed":
+        return "✅"
+    if bucket == "waiting":
+        return "❓"
+    if bucket == "pr-status":
         return "🔁"
-    if owner == "build-control":
-        return "▶️"
-    if state in {"CANCELLED", "parked"}:
+    if bucket == "planned":
+        return "🧭"
+    if bucket == "closed":
         return "🧹"
-    return "•"
+    return "▶️"
+
+
+def workflow_progress_counts(rows: list[Any]) -> dict[str, int]:
+    counts = {"completed": 0, "in-progress": 0, "waiting": 0, "planned": 0, "pr-status": 0, "closed": 0}
+    for row in rows:
+        if isinstance(row, dict):
+            bucket = workflow_bucket(row)
+            counts[bucket] = counts.get(bucket, 0) + 1
+    return counts
+
+
+def workflow_row_sort_key(row: Any) -> tuple[int, str]:
+    if not isinstance(row, dict):
+        return (99, "")
+    order = {"in-progress": 0, "waiting": 1, "planned": 2, "pr-status": 3, "completed": 4, "closed": 5}
+    return (order.get(workflow_bucket(row), 99), str(row.get("label") or row.get("task_id") or ""))
 
 
 def format_workflow_map(status: dict[str, Any]) -> str:
@@ -149,25 +180,43 @@ def format_workflow_map(status: dict[str, Any]) -> str:
     rows_raw = progress.get("workflow_map")
     rows = rows_raw if isinstance(rows_raw, list) else []
     if not rows:
+        state = str(status.get("state") or "UNKNOWN")
+        if state in {"CONTRACT", "CONTRACT_REVIEW", "DECOMPOSE", "QUESTION"}:
+            return (
+                "\n**Contained workflow / PR progress:**\n"
+                "Progress: no PR/build packets decomposed yet. Remaining planned PRs will appear here after contract approval/decomposition."
+            )
         return ""
-    lines = ["", "**Contained workflow / PR map:**"]
-    for row in rows[:8]:
+    counts = workflow_progress_counts(rows)
+    total_visible = sum(counts.values())
+    lines = [
+        "",
+        "**Contained workflow / PR progress:**",
+        (
+            f"Progress: ✅ {counts['completed']} complete · ▶️ {counts['in-progress']} in progress · "
+            f"❓ {counts['waiting']} waiting · 🧭 {counts['planned']} planned/left to build · "
+            f"🔁 {counts['pr-status']} with PR-status ({total_visible} visible)"
+        ),
+    ]
+    sorted_rows = sorted(rows, key=workflow_row_sort_key)
+    for row in sorted_rows[:10]:
         if not isinstance(row, dict):
             continue
         label = row.get("label") or row.get("task_id") or "task"
         title = str(row.get("title") or "").strip()
-        if len(title) > 70:
-            title = title[:67] + "..."
+        if len(title) > 60:
+            title = title[:57] + "..."
         state = row.get("state") or "UNKNOWN"
         owner = row.get("owner") or "unknown"
+        bucket = workflow_bucket(row)
         branch = f" — `{row.get('branch')}`" if row.get("branch") else ""
         pr = f" — {row.get('pr_url')}" if row.get("pr_url") else ""
-        lines.append(f"{workflow_icon(row)} {label} — {title} — `{state}` — owner: `{owner}`{branch}{pr}")
+        lines.append(f"{workflow_icon(row)} [{bucket}] {label} — {title} — `{state}` — owner: `{owner}`{branch}{pr}")
     hidden = progress.get("hidden_cancelled_count") or 0
     if hidden:
         lines.append(f"🧹 {hidden} superseded/cancelled generated packet(s) hidden from this card.")
-    if len(rows) > 8:
-        lines.append(f"… {len(rows) - 8} additional visible item(s) omitted for Discord length.")
+    if len(rows) > 10:
+        lines.append(f"… {len(rows) - 10} additional visible item(s) omitted for Discord length.")
     return "\n".join(lines)
 
 
