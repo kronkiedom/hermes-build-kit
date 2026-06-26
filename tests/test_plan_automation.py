@@ -1821,6 +1821,37 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertTrue(meta["awaiting_operator"])
             self.assertNotIn("operator_decision", meta)
             self.assertIn("concrete answer", meta["state_reason"])
+
+    def test_bare_approval_after_concrete_decision_does_not_reblock_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            task_dir = tmp_path / "tasks" / "task-decision"
+            task_dir.mkdir(parents=True)
+            (task_dir / "meta.json").write_text(json.dumps({
+                "task_id": "task-decision",
+                "state": "READY_FOR_BUILDER",
+                "state_reason": "readiness audit failed; builder should address blocking issues",
+                "awaiting_operator": False,
+                "operator_decision": {"content": "Choose Option A", "message_id": "decision-msg"},
+                "phase_status": {"DECISION": "ANSWERED", "EXECUTE": "READY_FOR_BUILDER"},
+                "pr_packet": {"kind": "decision_required", "packet_id": "decision-1", "status": "answered", "awaiting_operator": False},
+                "discord": {"thread_id": "thread-decision"},
+            }), encoding="utf-8")
+
+            result = plan_thread_poller.handle_operator_task_reply(tmp_path, {"task_id": "task-decision", "task_dir": str(task_dir)}, {
+                "id": "msg-approve-late",
+                "content": "approve",
+                "author": {"id": "op"},
+                "timestamp": "2026-06-26T01:00:00+00:00",
+            })
+
+            self.assertEqual(result["action"], "operator_task_reply_ignored_decision_already_answered")
+            meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["state"], "READY_FOR_BUILDER")
+            self.assertFalse(meta["awaiting_operator"])
+            self.assertEqual(meta["operator_decision"]["message_id"], "decision-msg")
+            self.assertIn("builder should address", meta["state_reason"])
+
     def test_plan_progress_reconciler_marks_answered_decision_ready_and_updates_parent(self):
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)

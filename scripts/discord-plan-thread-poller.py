@@ -207,6 +207,11 @@ def handle_operator_task_reply(repo_root: Path, task: dict[str, Any], message: d
     packet: dict[str, Any] = packet_raw if isinstance(packet_raw, dict) else {}
     if packet.get("kind") == "decision_required" and is_bare_approval(content):
         meta["last_operator_reply"] = reply
+        # A later bare "approve" should not reopen an already answered concrete decision.
+        if packet.get("status") == "answered" or isinstance(meta.get("operator_decision"), dict):
+            meta["updated_at"] = utc_now()
+            write_json(meta_path, meta)
+            return {"action": "operator_task_reply_ignored_decision_already_answered", "task_id": task_id, "next_state": meta.get("state")}
         meta["state_reason"] = "bare approval received, but this decision requires a concrete answer"
         meta["updated_at"] = utc_now()
         write_json(meta_path, meta)
