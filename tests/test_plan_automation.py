@@ -1559,6 +1559,52 @@ class PlanAutomationTests(unittest.TestCase):
             index = json.loads((tmp_path / ".automation" / "plans-index.json").read_text(encoding="utf-8"))
             self.assertEqual(index["plans"][plan_id]["state"], "EXECUTING")
             self.assertIn("active child task task-decision", index["plans"][plan_id]["state_reason"])
+            workflow_map = index["plans"][plan_id]["child_progress"]["workflow_map"]
+            self.assertEqual(workflow_map[0]["label"], "decision-1")
+            self.assertEqual(workflow_map[0]["owner"], "build-control")
+
+    def test_plan_card_renders_contained_pr_workflow_map(self):
+        status = {
+            "plan_id": "plan-upgrade",
+            "title": "Upgrade Migration",
+            "state": "EXECUTING",
+            "status": "IN_PROGRESS",
+            "reason": "active child task PR-B4 is DISPATCHED",
+            "repo": "/repo",
+            "base_branch": "main",
+            "child_progress": {
+                "workflow_map": [
+                    {"label": "PR #713", "title": "review status", "state": "DONE", "owner": "completed", "pr_url": "https://example/pr/713"},
+                    {"label": "PR #725", "title": "stacked maintenance", "state": "DONE", "owner": "completed", "pr_url": "https://example/pr/725"},
+                    {"label": "decision-pr-b4", "title": "Build PR-B4 / H7 empirical verify sandbox", "state": "DISPATCHED", "owner": "build-control", "branch": "decision/pr-b4-empirical-verify"},
+                ],
+                "hidden_cancelled_count": 68,
+            },
+        }
+
+        card = plan_status_lib.format_plan_card(status, "op")
+
+        self.assertIn("Contained workflow / PR map", card)
+        self.assertIn("PR #713", card)
+        self.assertIn("PR #725", card)
+        self.assertIn("decision-pr-b4", card)
+        self.assertIn("owner: `build-control`", card)
+        self.assertIn("68 superseded/cancelled", card)
+
+    def test_ensure_build_threads_skips_parent_contained_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            task_dir = tmp_path / "tasks" / "task-contained"
+            task_dir.mkdir(parents=True)
+            (task_dir / "meta.json").write_text(json.dumps({
+                "task_id": "task-contained",
+                "state": "DISPATCHED",
+                "discord": {"thread_id": "parent-thread", "contained_in_parent_thread": True},
+            }), encoding="utf-8")
+
+            payload = ensure_build_threads.ensure_threads(tmp_path, channel_id="channel", dry_run=True)
+
+            self.assertEqual(payload["action_count"], 0)
 
     def test_plan_progress_reconciler_marks_parent_done_when_children_terminal(self):
         with tempfile.TemporaryDirectory() as td:

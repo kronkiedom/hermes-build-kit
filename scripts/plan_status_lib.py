@@ -103,6 +103,7 @@ def classify_plan(plan: dict[str, Any]) -> dict[str, Any]:
         "updated_at": plan.get("updated_at"),
         "repo": plan.get("repo"),
         "base_branch": plan.get("base_branch"),
+        "child_progress": plan.get("child_progress") if isinstance(plan.get("child_progress"), dict) else {},
     }
 
 
@@ -126,6 +127,50 @@ def format_operator_alert(status: dict[str, Any], operator_user_id: str) -> str:
     )[:1900]
 
 
+def workflow_icon(row: dict[str, Any]) -> str:
+    state = str(row.get("state") or "")
+    owner = str(row.get("owner") or "")
+    if state == "DONE":
+        return "✅"
+    if owner == "operator":
+        return "❓"
+    if owner == "pr-status":
+        return "🔁"
+    if owner == "build-control":
+        return "▶️"
+    if state in {"CANCELLED", "parked"}:
+        return "🧹"
+    return "•"
+
+
+def format_workflow_map(status: dict[str, Any]) -> str:
+    progress_raw = status.get("child_progress")
+    progress: dict[str, Any] = progress_raw if isinstance(progress_raw, dict) else {}
+    rows_raw = progress.get("workflow_map")
+    rows = rows_raw if isinstance(rows_raw, list) else []
+    if not rows:
+        return ""
+    lines = ["", "**Contained workflow / PR map:**"]
+    for row in rows[:8]:
+        if not isinstance(row, dict):
+            continue
+        label = row.get("label") or row.get("task_id") or "task"
+        title = str(row.get("title") or "").strip()
+        if len(title) > 70:
+            title = title[:67] + "..."
+        state = row.get("state") or "UNKNOWN"
+        owner = row.get("owner") or "unknown"
+        branch = f" — `{row.get('branch')}`" if row.get("branch") else ""
+        pr = f" — {row.get('pr_url')}" if row.get("pr_url") else ""
+        lines.append(f"{workflow_icon(row)} {label} — {title} — `{state}` — owner: `{owner}`{branch}{pr}")
+    hidden = progress.get("hidden_cancelled_count") or 0
+    if hidden:
+        lines.append(f"🧹 {hidden} superseded/cancelled generated packet(s) hidden from this card.")
+    if len(rows) > 8:
+        lines.append(f"… {len(rows) - 8} additional visible item(s) omitted for Discord length.")
+    return "\n".join(lines)
+
+
 def format_plan_card(status: dict[str, Any], operator_user_id: str) -> str:
     title = status.get('title') or status.get('plan_id')
     state = str(status.get('state') or 'UNKNOWN')
@@ -141,6 +186,7 @@ def format_plan_card(status: dict[str, Any], operator_user_id: str) -> str:
         needs = "Run decomposition into PR/build packets."
     elif state == 'EXECUTING':
         needs = "Continue child build/decision packets until all are terminal."
+    workflow_map = format_workflow_map(status)
     question = ""
     if status.get('awaiting_operator') or state in {'QUESTION', 'CONTRACT_REVIEW'}:
         question = f"\n**Decision / reply needed:** <@{operator_user_id}> {needs}"
@@ -152,6 +198,7 @@ def format_plan_card(status: dict[str, Any], operator_user_id: str) -> str:
         f"**Where it is:** {reason}\n"
         f"**Needs to complete:** {needs}\n"
         f"**Repo/base:** `{status.get('repo') or 'unknown'}` / `{status.get('base_branch') or 'main'}`"
+        f"{workflow_map}"
         f"{question}\n\n"
         "Reply in this thread to progress the workflow. For plan approval, type `approve` with no slash. `/approve` is reserved for Hermes command approvals and may be blocked in build-control. Other replies are recorded and move waiting plans back to contract shaping."
     )[:1900]

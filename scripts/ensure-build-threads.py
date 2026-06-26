@@ -76,6 +76,8 @@ def ensure_threads(repo_root: Path, *, channel_id: str, token: str | None = None
             continue
         discord_raw = meta.get("discord")
         discord: dict[str, Any] = discord_raw if isinstance(discord_raw, dict) else {}
+        if discord.get("contained_in_parent_thread"):
+            continue
         needs_thread = bool(discord.get("requires_dedicated_thread")) and not discord.get("thread_id")
         has_thread = bool(discord.get("thread_id"))
         if not needs_thread and not has_thread:

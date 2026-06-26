@@ -144,6 +144,51 @@ def mark_decision_task_ready(task_dir: Path, meta: dict[str, Any], now: str, *, 
     return action
 
 
+def child_owner(meta: dict[str, Any]) -> str:
+    state = str(meta.get("state") or "UNKNOWN")
+    if state in {"DONE", "CANCELLED", "parked"}:
+        return "completed" if state == "DONE" else "closed/superseded"
+    if meta.get("awaiting_operator") or state == "QUESTION":
+        return "operator"
+    if is_handed_to_pr_status(meta):
+        return "pr-status"
+    return "build-control"
+
+
+def child_workflow_row(task_dir: Path, meta: dict[str, Any]) -> dict[str, Any]:
+    packet = task_packet(meta)
+    github = task_github(meta)
+    state = str(meta.get("state") or "UNKNOWN")
+    pr_number = github.get("pr_number") or packet.get("pr_number")
+    label = f"PR #{pr_number}" if pr_number else str(packet.get("packet_id") or meta.get("task_id") or task_dir.name)
+    title = str(packet.get("title") or meta.get("title") or meta.get("task_id") or task_dir.name)
+    if pr_number and title.startswith("Decision needed:"):
+        title = title.replace("Decision needed:", "").strip()
+    return {
+        "task_id": meta.get("task_id") or task_dir.name,
+        "label": label,
+        "title": title,
+        "state": state,
+        "owner": child_owner(meta),
+        "awaiting_operator": bool(meta.get("awaiting_operator")),
+        "branch": packet.get("branch") or meta.get("branch"),
+        "depends_on": packet.get("depends_on") if isinstance(packet.get("depends_on"), list) else [],
+        "pr_number": pr_number,
+        "pr_url": github.get("pr_url") or github.get("draft_pr_url"),
+        "merged_at": github.get("merged_at"),
+        "thread_id": (meta.get("discord") or {}).get("thread_id") if isinstance(meta.get("discord"), dict) else None,
+        "state_reason": meta.get("state_reason") or "",
+    }
+
+
+def should_display_child(row: dict[str, Any]) -> bool:
+    if row.get("pr_number") or row.get("pr_url"):
+        return True
+    if row.get("state") not in {"CANCELLED", "parked"}:
+        return True
+    return False
+
+
 def summarize_child_progress(children: list[tuple[Path, dict[str, Any]]]) -> dict[str, Any]:
     total = len(children)
     terminal = [(d, m) for d, m in children if is_terminal_task(m)]
@@ -151,6 +196,9 @@ def summarize_child_progress(children: list[tuple[Path, dict[str, Any]]]) -> dic
     waiting = [(d, m) for d, m in active if m.get("awaiting_operator") or str(m.get("state") or "") == "QUESTION"]
     handed = [(d, m) for d, m in active if is_handed_to_pr_status(m)]
     build_owned = [(d, m) for d, m in active if not is_handed_to_pr_status(m)]
+    rows = [child_workflow_row(d, m) for d, m in children]
+    visible_rows = [row for row in rows if should_display_child(row)]
+    hidden_cancelled = len([row for row in rows if row not in visible_rows and row.get("state") in {"CANCELLED", "parked"}])
     return {
         "total": total,
         "terminal_count": len(terminal),
@@ -162,6 +210,8 @@ def summarize_child_progress(children: list[tuple[Path, dict[str, Any]]]) -> dic
         "waiting": waiting,
         "handed": handed,
         "terminal": terminal,
+        "workflow_map": visible_rows,
+        "hidden_cancelled_count": hidden_cancelled,
     }
 
 
@@ -238,7 +288,17 @@ def reconcile_plan_progress(repo_root: Path, *, dry_run: bool = False) -> dict[s
         progress = summarize_child_progress(children)
         reason = parent_reason(progress)
         desired_state = "DONE" if progress["total"] and progress["active_count"] == 0 else "EXECUTING"
-        if meta.get("state") != desired_state or meta.get("state_reason") != reason:
+        latest_child_progress = {
+            "total": progress["total"],
+            "terminal_count": progress["terminal_count"],
+            "active_count": progress["active_count"],
+            "waiting_count": progress["waiting_count"],
+            "handoff_count": progress["handoff_count"],
+            "build_owned_count": progress["build_owned_count"],
+            "workflow_map": progress["workflow_map"],
+            "hidden_cancelled_count": progress["hidden_cancelled_count"],
+        }
+        if meta.get("state") != desired_state or meta.get("state_reason") != reason or meta.get("child_progress") != latest_child_progress:
             actions.append({
                 "action": "would_update_parent_plan" if dry_run else "updated_parent_plan",
                 "plan_id": plan_id,
@@ -250,14 +310,7 @@ def reconcile_plan_progress(repo_root: Path, *, dry_run: bool = False) -> dict[s
                 meta["state"] = desired_state
                 meta["awaiting_operator"] = False
                 meta["state_reason"] = reason
-                meta["child_progress"] = {
-                    "total": progress["total"],
-                    "terminal_count": progress["terminal_count"],
-                    "active_count": progress["active_count"],
-                    "waiting_count": progress["waiting_count"],
-                    "handoff_count": progress["handoff_count"],
-                    "build_owned_count": progress["build_owned_count"],
-                }
+                meta["child_progress"] = latest_child_progress
                 meta["updated_at"] = now
                 write_json(meta_path, meta)
         if not dry_run:
@@ -273,6 +326,8 @@ def reconcile_plan_progress(repo_root: Path, *, dry_run: bool = False) -> dict[s
                 "waiting_count": progress["waiting_count"],
                 "handoff_count": progress["handoff_count"],
                 "build_owned_count": progress["build_owned_count"],
+                "workflow_map": progress["workflow_map"],
+                "hidden_cancelled_count": progress["hidden_cancelled_count"],
             },
         })
 
