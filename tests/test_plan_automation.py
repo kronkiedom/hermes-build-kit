@@ -1442,6 +1442,69 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertIn("operator_decision", meta)
             replies = (task_dir / "operator-replies.jsonl").read_text(encoding="utf-8")
             self.assertIn("rootless podman", replies)
+    def test_parent_plan_reply_routes_to_single_child_decision_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            plan_id = "plan-parent"
+            plan_dir = tmp_path / "plans" / plan_id
+            task_dir = tmp_path / "tasks" / "task-decision"
+            plan_dir.mkdir(parents=True)
+            task_dir.mkdir(parents=True)
+            (plan_dir / "meta.json").write_text(json.dumps({
+                "plan_id": plan_id,
+                "title": "Parent plan",
+                "state": "EXECUTING",
+                "discord": {"thread_id": "thread-plan"},
+            }), encoding="utf-8")
+            (task_dir / "meta.json").write_text(json.dumps({
+                "task_id": "task-decision",
+                "source_plan_id": plan_id,
+                "state": "QUESTION",
+                "awaiting_operator": True,
+                "pr_packet": {"kind": "decision_required", "packet_id": "decision-1"},
+                "discord": {"thread_id": "thread-task"},
+            }), encoding="utf-8")
+
+            result = plan_thread_poller.handle_operator_reply(tmp_path, {"plan_id": plan_id, "plan_dir": str(plan_dir), "state": "EXECUTING"}, {
+                "id": "msg-1",
+                "content": "Use rootless Podman with public digest-pinned image.",
+                "author": {"id": "op"},
+                "timestamp": "2026-06-26T00:00:00+00:00",
+            })
+
+            self.assertEqual(result["action"], "operator_reply_routed_to_child_task")
+            self.assertEqual(result["child_action"]["action"], "operator_task_reply_ingested")
+            meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["state"], "SHAPE")
+            self.assertFalse(meta["awaiting_operator"])
+            self.assertIn("operator_decision", meta)
+
+    def test_bare_approval_does_not_satisfy_concrete_decision_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            task_dir = tmp_path / "tasks" / "task-decision"
+            task_dir.mkdir(parents=True)
+            (task_dir / "meta.json").write_text(json.dumps({
+                "task_id": "task-decision",
+                "state": "QUESTION",
+                "awaiting_operator": True,
+                "pr_packet": {"kind": "decision_required", "packet_id": "decision-1"},
+                "discord": {"thread_id": "thread-decision"},
+            }), encoding="utf-8")
+
+            result = plan_thread_poller.handle_operator_task_reply(tmp_path, {"task_id": "task-decision", "task_dir": str(task_dir)}, {
+                "id": "msg-approve",
+                "content": "approve",
+                "author": {"id": "op"},
+                "timestamp": "2026-06-26T00:00:00+00:00",
+            })
+
+            self.assertEqual(result["action"], "operator_task_reply_needs_concrete_decision")
+            meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["state"], "QUESTION")
+            self.assertTrue(meta["awaiting_operator"])
+            self.assertNotIn("operator_decision", meta)
+            self.assertIn("concrete answer", meta["state_reason"])
 
 
 if __name__ == "__main__":

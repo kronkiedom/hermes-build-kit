@@ -128,6 +128,13 @@ def handle_operator_reply(repo_root: Path, plan: dict[str, Any], message: dict[s
     if action in {"APPROVE", "REJECT", "CANCEL"} and str(plan.get("state")) == "CONTRACT_REVIEW":
         return {"action": "contract_decision_recorded", "decision": action, **record_contract_approval(repo_root, plan_id, decision=action, source="discord-thread", message_id=reply["message_id"])}
 
+    child_tasks = find_active_child_operator_tasks(repo_root, plan_id)
+    if child_tasks:
+        if len(child_tasks) == 1:
+            routed = handle_operator_task_reply(repo_root, child_tasks[0], message)
+            return {"action": "operator_reply_routed_to_child_task", "plan_id": plan_id, "child_action": routed}
+        return {"action": "operator_reply_ambiguous_child_tasks", "plan_id": plan_id, "child_task_count": len(child_tasks)}
+
     meta_path = plan_dir / "meta.json"
     meta = read_json(meta_path, {})
     if isinstance(meta, dict) and (meta.get("state") == "QUESTION" or meta.get("awaiting_operator")):
@@ -148,6 +155,28 @@ def handle_operator_reply(repo_root: Path, plan: dict[str, Any], message: dict[s
         })
         return {"action": "operator_reply_ingested", "plan_id": plan_id, "next_state": "CONTRACT"}
     return {"action": "operator_reply_recorded", "plan_id": plan_id}
+
+
+def find_active_child_operator_tasks(repo_root: Path, plan_id: str) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for meta_path in sorted((repo_root / "tasks").glob("*/meta.json")):
+        meta = read_json(meta_path, {})
+        if not isinstance(meta, dict):
+            continue
+        if str(meta.get("source_plan_id") or "") != plan_id:
+            continue
+        if str(meta.get("state") or "") in {"DONE", "CANCELLED"}:
+            continue
+        packet_raw = meta.get("pr_packet")
+        packet: dict[str, Any] = packet_raw if isinstance(packet_raw, dict) else {}
+        if meta.get("awaiting_operator") or packet.get("kind") == "decision_required":
+            out.append({**meta, "task_dir": str(meta_path.parent)})
+    return out
+
+
+def is_bare_approval(content: str) -> bool:
+    normalized = content.strip().lower()
+    return normalized in {"approve", "approved", "lgtm", "yes", "ok", "go", "ship it"}
 
 
 def append_task_reply(task_dir: Path, reply: dict[str, Any]) -> None:
@@ -172,6 +201,14 @@ def handle_operator_task_reply(repo_root: Path, task: dict[str, Any], message: d
     meta = read_json(meta_path, {})
     if not isinstance(meta, dict):
         return {"action": "operator_task_reply_recorded", "task_id": task_id}
+    packet_raw = meta.get("pr_packet")
+    packet: dict[str, Any] = packet_raw if isinstance(packet_raw, dict) else {}
+    if packet.get("kind") == "decision_required" and is_bare_approval(content):
+        meta["last_operator_reply"] = reply
+        meta["state_reason"] = "bare approval received, but this decision requires a concrete answer"
+        meta["updated_at"] = utc_now()
+        write_json(meta_path, meta)
+        return {"action": "operator_task_reply_needs_concrete_decision", "task_id": task_id, "next_state": meta.get("state")}
     meta["operator_decision"] = reply
     meta["awaiting_operator"] = False
     meta["decision_answered_at"] = reply["ingested_at"]
