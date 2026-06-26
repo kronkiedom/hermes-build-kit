@@ -175,6 +175,8 @@ The readiness gate is event-based: call `scripts/pr-readiness-gate.py` when a br
 
 The PR status monitor is safe-by-default: `scripts/github-pr-status-monitor.py` updates one Discord message per open operator-authored PR and opens/pings an issue thread when reviews, comments, failing checks, or rebase states need attention.
 
+Because the PR status monitor intentionally searches only open PRs, `scripts/reconcile-merged-prs.py` closes the loop after merge: it scans task packets with `pr_packet.pr_number`, queries those PRs by number, marks merged PR tasks `DONE`, and sets `dependencies_cleared` on dependent decision/build packets. The cron wrapper is `bk-merged-pr-reconciler.sh`.
+
 ## Open plan router and thread replies
 
 `scripts/open-plan-router.py` classifies each open plan into the next safe handler/action. It makes stalled-looking `CONTRACT` plans explicit (`shape_contract`, `agent_required`) and routes `EXECUTING` plans to `scripts/dispatch-pr-worker.py` when the dispatcher exists.

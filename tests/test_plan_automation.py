@@ -33,6 +33,7 @@ publish_draft_pr = load_script_module("publish_draft_pr_script", "publish-draft-
 stall_detector = load_script_module("stall_detector_script", "stall-detector.py")
 render_dashboard = load_script_module("render_dashboard_script", "render-dashboard.py")
 ensure_build_threads = load_script_module("ensure_build_threads_script", "ensure-build-threads.py")
+reconcile_merged_prs = load_script_module("reconcile_merged_prs_script", "reconcile-merged-prs.py")
 
 
 def run_script(repo: Path, *args: str) -> subprocess.CompletedProcess:
@@ -1209,6 +1210,65 @@ class PlanAutomationTests(unittest.TestCase):
 
             redecomposed = json.loads((maint_dir / "meta.json").read_text(encoding="utf-8"))
             self.assertEqual(redecomposed["discord"]["thread_id"], "thread-pr725")
+
+    def test_reconcile_merged_prs_marks_pr_tasks_done_and_unblocks_dependents(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            plan_id = "plan-upgrade"
+            (tmp_path / "tasks").mkdir()
+            def write_task(task_id, state, packet, awaiting=False):
+                task_dir = tmp_path / "tasks" / task_id
+                task_dir.mkdir()
+                (task_dir / "meta.json").write_text(json.dumps({
+                    "task_id": task_id,
+                    "source_plan_id": plan_id,
+                    "state": state,
+                    "awaiting_operator": awaiting,
+                    "state_reason": "test",
+                    "pr_packet": packet,
+                }), encoding="utf-8")
+                return task_dir
+            t713 = write_task("task-713", "PR_STATUS", {"kind": "pr_status_wait", "packet_id": "pr713-review", "pr_number": 713, "depends_on": []})
+            t725 = write_task("task-725", "SHAPE", {"kind": "pr_maintenance", "packet_id": "pr725-stacked-maintenance", "pr_number": 725, "depends_on": ["pr713-review"]})
+            tb4 = write_task("task-b4", "QUESTION", {"kind": "decision_required", "packet_id": "decision-pr-b4", "depends_on": ["pr713-review", "pr725-stacked-maintenance"]}, awaiting=True)
+
+            pr_data = {
+                713: {"number": 713, "state": "MERGED", "url": "https://example/pr/713", "mergedAt": "2026-06-25T20:01:30Z", "headRefOid": "sha713"},
+                725: {"number": 725, "state": "MERGED", "url": "https://example/pr/725", "mergedAt": "2026-06-26T02:45:12Z", "headRefOid": "sha725"},
+            }
+
+            result = reconcile_merged_prs.reconcile_merged_prs(tmp_path, fetch_pr=lambda n, repo: pr_data[n])
+
+            self.assertEqual(result["merged_count"], 2)
+            m713 = json.loads((t713 / "meta.json").read_text(encoding="utf-8"))
+            m725 = json.loads((t725 / "meta.json").read_text(encoding="utf-8"))
+            mb4 = json.loads((tb4 / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(m713["state"], "DONE")
+            self.assertEqual(m725["state"], "DONE")
+            self.assertEqual(m713["github"]["merged_at"], "2026-06-25T20:01:30Z")
+            self.assertEqual(m725["github"]["head_sha"], "sha725")
+            self.assertEqual(mb4["state"], "QUESTION")
+            self.assertTrue(mb4["awaiting_operator"])
+            self.assertTrue(mb4["dependencies_cleared"])
+            self.assertIn("dependencies cleared", mb4["state_reason"])
+
+    def test_reconcile_merged_prs_leaves_open_pr_task_waiting(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            task_dir = tmp_path / "tasks" / "task-1"
+            task_dir.mkdir(parents=True)
+            (task_dir / "meta.json").write_text(json.dumps({
+                "task_id": "task-1",
+                "state": "PR_STATUS",
+                "awaiting_operator": False,
+                "pr_packet": {"kind": "pr_status_wait", "packet_id": "pr1-review", "pr_number": 1},
+            }), encoding="utf-8")
+
+            result = reconcile_merged_prs.reconcile_merged_prs(tmp_path, fetch_pr=lambda n, repo: {"number": n, "state": "OPEN"})
+
+            self.assertEqual(result["merged_count"], 0)
+            meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["state"], "PR_STATUS")
 
     def test_ensure_build_threads_dry_run_lists_each_in_flight_task_thread(self):
         with tempfile.TemporaryDirectory() as td:
