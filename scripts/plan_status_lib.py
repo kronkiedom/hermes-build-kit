@@ -85,7 +85,10 @@ def load_plan_meta(repo_root: Path, plan_entry: dict[str, Any]) -> dict[str, Any
 
 def classify_plan(plan: dict[str, Any]) -> dict[str, Any]:
     state = str(plan.get("state") or "UNKNOWN")
-    awaiting_operator = bool(plan.get("awaiting_operator")) or state in OPERATOR_WAIT_STATES
+    progress_raw = plan.get("child_progress")
+    progress: dict[str, Any] = progress_raw if isinstance(progress_raw, dict) else {}
+    child_waiting = int(progress.get("waiting_count") or 0) > 0
+    awaiting_operator = bool(plan.get("awaiting_operator")) or state in OPERATOR_WAIT_STATES or child_waiting
     terminal = state in TERMINAL_PLAN_STATES
     thread_id = str((plan.get("discord") or {}).get("thread_id") or plan.get("thread_id") or "")
     plan_card_message_id = str((plan.get("discord") or {}).get("plan_card_message_id") or plan.get("plan_card_message_id") or "")

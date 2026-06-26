@@ -1940,6 +1940,18 @@ class PlanAutomationTests(unittest.TestCase):
         self.assertIn("owner: `build-control`", card)
         self.assertIn("68 superseded/cancelled", card)
 
+    def test_plan_status_treats_waiting_child_as_operator_waiting(self):
+        status = plan_status_lib.classify_plan({
+            "plan_id": "plan-child-waiting",
+            "title": "Child waiting plan",
+            "state": "EXECUTING",
+            "state_reason": "waiting on child task task-1 (ESCALATED)",
+            "child_progress": {"waiting_count": 1, "workflow_map": []},
+        })
+
+        self.assertTrue(status["awaiting_operator"])
+        self.assertEqual(status["status"], "OPERATOR_WAITING")
+
     def test_plan_card_renders_pre_decomposition_progress_placeholder(self):
         status = {
             "plan_id": "plan-contract",
