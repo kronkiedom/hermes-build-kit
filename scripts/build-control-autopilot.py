@@ -58,6 +58,7 @@ def advance_build_control(repo_root: Path, *, execute: bool = False) -> dict[str
     dispatch_worker = load_script("dispatch_pr_worker_script", "dispatch-pr-worker.py")
     reconciler = load_script("reconcile_plan_progress_script", "reconcile-plan-progress.py")
     auto_builder = load_script("auto_builder_runner_script", "auto-builder-runner.py")
+    pre_pr_rebase = load_script("pre_pr_rebase_autocure_script", "pre-pr-rebase-autocure.py")
     auto_publish = load_script("auto_publish_runner_script", "auto-publish-runner.py")
 
     actions: list[dict[str, Any]] = []
@@ -70,6 +71,9 @@ def advance_build_control(repo_root: Path, *, execute: bool = False) -> dict[str
     builder = auto_builder.auto_run_builder(repo_root, execute=execute)
     actions.append({"action": "auto_builder", "result": builder})
     actions.append({"action": "plan_progress_after_builder", "result": reconciler.reconcile_plan_progress(repo_root, dry_run=not execute)})
+    rebase = pre_pr_rebase.autocure_pre_pr_rebase(repo_root, execute=execute)
+    actions.append({"action": "pre_pr_rebase_autocure", "result": rebase})
+    actions.append({"action": "plan_progress_after_pre_pr_rebase", "result": reconciler.reconcile_plan_progress(repo_root, dry_run=not execute)})
     publisher = auto_publish.auto_publish(repo_root, execute=execute)
     actions.append({"action": "auto_publish", "result": publisher})
     actions.append({"action": "plan_progress_after_publish", "result": reconciler.reconcile_plan_progress(repo_root, dry_run=not execute)})

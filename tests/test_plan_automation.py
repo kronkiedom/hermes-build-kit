@@ -37,6 +37,7 @@ reconcile_merged_prs = load_script_module("reconcile_merged_prs_script", "reconc
 reconcile_plan_progress = load_script_module("reconcile_plan_progress_script", "reconcile-plan-progress.py")
 auto_builder_runner = load_script_module("auto_builder_runner_script", "auto-builder-runner.py")
 auto_publish_runner = load_script_module("auto_publish_runner_script", "auto-publish-runner.py")
+pre_pr_rebase_autocure = load_script_module("pre_pr_rebase_autocure_script", "pre-pr-rebase-autocure.py")
 build_control_autopilot = load_script_module("build_control_autopilot_script", "build-control-autopilot.py")
 
 
@@ -709,6 +710,57 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertEqual(meta["state"], "VERIFYING")
             self.assertTrue((Path(meta["dispatch"]["worktree"]) / "AUTO_BUILD.md").exists())
 
+    def test_pre_pr_rebase_autocure_rebases_clean_built_task_and_requeues_readiness(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            origin = tmp_path / "origin-repo"
+            worktree = tmp_path / "worktree"
+            origin.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=origin, check=True, text=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=origin, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=origin, check=True)
+            (origin / "README.md").write_text("# demo\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=origin, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=origin, check=True, text=True, capture_output=True)
+            subprocess.run(["git", "clone", str(origin), str(worktree)], check=True, text=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=worktree, check=True)
+            subprocess.run(["git", "checkout", "-b", "feat/pre-pr"], cwd=worktree, check=True, text=True, capture_output=True)
+            (worktree / "FEATURE.md").write_text("feature\n", encoding="utf-8")
+            subprocess.run(["git", "add", "FEATURE.md"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "feat: pre pr work"], cwd=worktree, check=True, text=True, capture_output=True)
+            old_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=worktree, check=True, text=True, capture_output=True).stdout.strip()
+
+            (origin / "BASE.md").write_text("base moved\n", encoding="utf-8")
+            subprocess.run(["git", "add", "BASE.md"], cwd=origin, check=True)
+            subprocess.run(["git", "commit", "-m", "docs: move base"], cwd=origin, check=True, text=True, capture_output=True)
+
+            task_id = "task-pre-pr-rebase"
+            task_dir = tmp_path / "tasks" / task_id
+            task_dir.mkdir(parents=True)
+            job = create_readiness_job(tmp_path, task_id=task_id, branch="feat/pre-pr", sha=old_sha)
+            (task_dir / "meta.json").write_text(json.dumps({
+                "task_id": task_id,
+                "state": "VERIFYING",
+                "awaiting_operator": False,
+                "dispatch": {"worktree": str(worktree), "branch": "feat/pre-pr", "base_branch": "main"},
+                "build": {"commit_sha": old_sha, "readiness_job_id": job["job_id"]},
+            }), encoding="utf-8")
+
+            result = pre_pr_rebase_autocure.autocure_pre_pr_rebase(tmp_path, execute=True)
+
+            self.assertEqual(result["decision"], "REBASED_READINESS_QUEUED")
+            self.assertEqual(result["before_sha"], old_sha)
+            self.assertNotEqual(result["after_sha"], old_sha)
+            meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["state"], "VERIFYING")
+            self.assertEqual(meta["build"]["commit_sha"], result["after_sha"])
+            self.assertEqual(meta["build"]["readiness_job_id"], result["readiness_job_id"])
+            new_job_path = tmp_path / ".automation" / "pr-readiness" / f"{result['readiness_job_id']}.json"
+            new_job = json.loads(new_job_path.read_text(encoding="utf-8"))
+            self.assertEqual(new_job["state"], "READINESS_QUEUED")
+            self.assertEqual(new_job["sha"], result["after_sha"])
+
     def test_publish_draft_pr_blocks_until_readiness_passes_for_current_sha(self):
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
@@ -836,6 +888,7 @@ class PlanAutomationTests(unittest.TestCase):
             action_names = [action["action"] for action in result["actions"]]
             self.assertIn("decomposed_plan", action_names)
             self.assertIn("dispatch", action_names)
+            self.assertIn("pre_pr_rebase_autocure", action_names)
             tasks = list((tmp_path / "tasks").glob("*/meta.json"))
             self.assertEqual(len(tasks), 1)
             meta = json.loads(tasks[0].read_text(encoding="utf-8"))

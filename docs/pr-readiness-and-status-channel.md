@@ -143,8 +143,11 @@ python3 scripts/pr-rebase-autocure.py owner/repo#123 --authorized-push
 
 This uses `git push --force-with-lease` after a clean rebase. If conflicts occur, it exits nonzero and reports the worktree path so an interactive fix session can continue there.
 
+For pre-PR build-control task branches, `scripts/pre-pr-rebase-autocure.py` runs inside the build-control loop before draft PR publishing. It fetches the task worktree base branch, detects `behind > 0`, rebases a clean worktree locally, and queues a fresh SHA-scoped readiness job for the rebased commit. It never pushes. Dirty worktrees or rebase conflicts fail closed by marking the task as operator-required so the loop does not repeatedly publish stale evidence.
+
 ## Recommended live wiring
 
 - `submit_pr_ready` / handoff workflows call `scripts/pr-readiness-gate.py` directly. This is event-based, not cron-based.
+- `scripts/build-control-autopilot.py` runs `scripts/pre-pr-rebase-autocure.py` after builder execution and before `scripts/auto-publish-runner.py`, so a branch that fell behind during verification is rebased and re-audited before any draft PR publish attempt.
 - GitHub webhook handling should call `scripts/github-pr-status-monitor.py` or equivalent targeted sync when PR review/comment/check events arrive.
 - A low-frequency cron sweeper may run the monitor as a reconciliation backup so missed webhook events do not hide stale review feedback.
