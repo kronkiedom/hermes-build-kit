@@ -34,6 +34,7 @@ stall_detector = load_script_module("stall_detector_script", "stall-detector.py"
 render_dashboard = load_script_module("render_dashboard_script", "render-dashboard.py")
 ensure_build_threads = load_script_module("ensure_build_threads_script", "ensure-build-threads.py")
 reconcile_merged_prs = load_script_module("reconcile_merged_prs_script", "reconcile-merged-prs.py")
+reconcile_plan_progress = load_script_module("reconcile_plan_progress_script", "reconcile-plan-progress.py")
 
 
 def run_script(repo: Path, *args: str) -> subprocess.CompletedProcess:
@@ -1508,6 +1509,93 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertTrue(meta["awaiting_operator"])
             self.assertNotIn("operator_decision", meta)
             self.assertIn("concrete answer", meta["state_reason"])
+    def test_plan_progress_reconciler_marks_answered_decision_ready_and_updates_parent(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            plan_id = "plan-upgrade"
+            plan_dir = tmp_path / "plans" / plan_id
+            task_dir = tmp_path / "tasks" / "task-decision"
+            (tmp_path / ".automation").mkdir(parents=True)
+            plan_dir.mkdir(parents=True)
+            task_dir.mkdir(parents=True)
+            (tmp_path / ".automation" / "plans-index.json").write_text(json.dumps({"plans": {plan_id: {
+                "plan_id": plan_id,
+                "plan_dir": str(plan_dir),
+                "state": "EXECUTING",
+                "thread_id": "thread-plan",
+            }}}), encoding="utf-8")
+            (plan_dir / "meta.json").write_text(json.dumps({
+                "plan_id": plan_id,
+                "title": "Upgrade plan",
+                "state": "EXECUTING",
+                "repo": "/repo",
+                "base_branch": "main",
+                "discord": {"thread_id": "thread-plan"},
+                "state_reason": "decomposed",
+            }), encoding="utf-8")
+            (task_dir / "meta.json").write_text(json.dumps({
+                "task_id": "task-decision",
+                "source_plan_id": plan_id,
+                "state": "SHAPE",
+                "awaiting_operator": False,
+                "operator_decision": {"content": "Option A"},
+                "phase_status": {"DECISION": "ANSWERED", "SHAPE": "ACTIVE"},
+                "pr_packet": {"kind": "decision_required", "packet_id": "decision-1", "awaiting_operator": False, "status": "answered"},
+            }), encoding="utf-8")
+
+            result = reconcile_plan_progress.reconcile_plan_progress(tmp_path)
+
+            self.assertIn("marked_decision_ready", {a["action"] for a in result["actions"]})
+            self.assertIn("updated_parent_plan", {a["action"] for a in result["actions"]})
+            task_meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(task_meta["phase_status"]["SHAPE"], "READY")
+            self.assertEqual(task_meta["state_reason"], "decision answered; ready for dispatch")
+            task_md = (task_dir / "task.md").read_text(encoding="utf-8")
+            self.assertIn("Decision: Option A", task_md)
+            self.assertIn("public digest-pinned verify image", task_md)
+            plan_meta = json.loads((plan_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan_meta["state"], "EXECUTING")
+            self.assertIn("active child task task-decision is SHAPE", plan_meta["state_reason"])
+            index = json.loads((tmp_path / ".automation" / "plans-index.json").read_text(encoding="utf-8"))
+            self.assertEqual(index["plans"][plan_id]["state"], "EXECUTING")
+            self.assertIn("active child task task-decision", index["plans"][plan_id]["state_reason"])
+
+    def test_plan_progress_reconciler_marks_parent_done_when_children_terminal(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            plan_id = "plan-done"
+            plan_dir = tmp_path / "plans" / plan_id
+            task_dir = tmp_path / "tasks" / "task-done"
+            (tmp_path / ".automation").mkdir(parents=True)
+            plan_dir.mkdir(parents=True)
+            task_dir.mkdir(parents=True)
+            (tmp_path / ".automation" / "plans-index.json").write_text(json.dumps({"plans": {plan_id: {
+                "plan_id": plan_id,
+                "plan_dir": str(plan_dir),
+                "state": "EXECUTING",
+                "thread_id": "thread-plan",
+            }}}), encoding="utf-8")
+            (plan_dir / "meta.json").write_text(json.dumps({
+                "plan_id": plan_id,
+                "title": "Done plan",
+                "state": "EXECUTING",
+                "discord": {"thread_id": "thread-plan"},
+            }), encoding="utf-8")
+            (task_dir / "meta.json").write_text(json.dumps({
+                "task_id": "task-done",
+                "source_plan_id": plan_id,
+                "state": "DONE",
+                "awaiting_operator": False,
+            }), encoding="utf-8")
+
+            result = reconcile_plan_progress.reconcile_plan_progress(tmp_path)
+
+            self.assertIn("updated_parent_plan", {a["action"] for a in result["actions"]})
+            plan_meta = json.loads((plan_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan_meta["state"], "DONE")
+            self.assertEqual(plan_meta["child_progress"]["terminal_count"], 1)
+            index = json.loads((tmp_path / ".automation" / "plans-index.json").read_text(encoding="utf-8"))
+            self.assertEqual(index["plans"][plan_id]["state"], "DONE")
 
 
 if __name__ == "__main__":

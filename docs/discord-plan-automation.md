@@ -177,6 +177,8 @@ The PR status monitor is safe-by-default: `scripts/github-pr-status-monitor.py` 
 
 Because the PR status monitor intentionally searches only open PRs, `scripts/reconcile-merged-prs.py` closes the loop after merge: it scans task packets with `pr_packet.pr_number`, queries those PRs by number, marks merged PR tasks `DONE`, and sets `dependencies_cleared` on dependent decision/build packets. The cron wrapper is `bk-merged-pr-reconciler.sh`.
 
+`scripts/reconcile-plan-progress.py` closes the parent-plan lifecycle loop: it scans child tasks by `source_plan_id`, promotes answered decision packets to dispatch-ready, updates parent plan state/reason from active child progress, and marks the parent `DONE` once every child task is terminal. The cron wrapper is `bk-plan-progress-reconciler.sh`.
+
 ## Open plan router and thread replies
 
 `scripts/open-plan-router.py` classifies each open plan into the next safe handler/action. It makes stalled-looking `CONTRACT` plans explicit (`shape_contract`, `agent_required`) and routes `EXECUTING` plans to `scripts/dispatch-pr-worker.py` when the dispatcher exists.
