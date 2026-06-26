@@ -36,6 +36,8 @@ ensure_build_threads = load_script_module("ensure_build_threads_script", "ensure
 reconcile_merged_prs = load_script_module("reconcile_merged_prs_script", "reconcile-merged-prs.py")
 reconcile_plan_progress = load_script_module("reconcile_plan_progress_script", "reconcile-plan-progress.py")
 auto_builder_runner = load_script_module("auto_builder_runner_script", "auto-builder-runner.py")
+auto_publish_runner = load_script_module("auto_publish_runner_script", "auto-publish-runner.py")
+build_control_autopilot = load_script_module("build_control_autopilot_script", "build-control-autopilot.py")
 
 
 def run_script(repo: Path, *args: str) -> subprocess.CompletedProcess:
@@ -780,6 +782,65 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertEqual(result["head"], "dom-armor:feat/demo-publish")
             meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["state"], "VERIFYING")
+
+    def test_auto_publish_blocks_without_publish_config(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            task_id = "task-built"
+            task_dir = tmp_path / "tasks" / task_id
+            worktree = tmp_path / "worktree"
+            task_dir.mkdir(parents=True)
+            worktree.mkdir()
+            (task_dir / "meta.json").write_text(json.dumps({
+                "task_id": task_id,
+                "state": "VERIFYING",
+                "awaiting_operator": False,
+                "dispatch": {"worktree": str(worktree), "branch": "feat/built"},
+                "build": {"readiness_job_id": "readiness-1"},
+            }), encoding="utf-8")
+
+            result = auto_publish_runner.auto_publish(tmp_path, execute=True)
+
+            self.assertEqual(result["decision"], "BLOCKED")
+            self.assertIn("draft PR publishing is not configured", result["reason"])
+
+    def test_build_control_autopilot_decomposes_dispatches_and_blocks_on_missing_builder(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            target_repo = tmp_path / "target-repo"
+            target_repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=target_repo, check=True, text=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=target_repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=target_repo, check=True)
+            (target_repo / "README.md").write_text("# demo\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=target_repo, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=target_repo, check=True, text=True, capture_output=True)
+            subprocess.run(["git", "remote", "add", "origin", str(target_repo)], cwd=target_repo, check=True)
+            plan_id = "plan-auto"
+            plan_dir = tmp_path / "plans" / plan_id
+            (tmp_path / ".automation").mkdir(parents=True)
+            plan_dir.mkdir(parents=True)
+            (plan_dir / "source-plan.md").write_text("# Auto plan\n\n- add docs\n", encoding="utf-8")
+            (plan_dir / "meta.json").write_text(json.dumps({
+                "plan_id": plan_id,
+                "title": "Auto plan",
+                "state": "DECOMPOSE",
+                "repo": str(target_repo),
+                "base_branch": "main",
+                "discord": {"thread_id": "thread-plan"},
+            }), encoding="utf-8")
+            (tmp_path / ".automation" / "plans-index.json").write_text(json.dumps({"plans": {plan_id: {"plan_id": plan_id, "plan_dir": str(plan_dir), "state": "DECOMPOSE"}}}), encoding="utf-8")
+
+            result = build_control_autopilot.advance_build_control(tmp_path, execute=True)
+
+            action_names = [action["action"] for action in result["actions"]]
+            self.assertIn("decomposed_plan", action_names)
+            self.assertIn("dispatch", action_names)
+            tasks = list((tmp_path / "tasks").glob("*/meta.json"))
+            self.assertEqual(len(tasks), 1)
+            meta = json.loads(tasks[0].read_text(encoding="utf-8"))
+            self.assertEqual(meta["state"], "READY_FOR_BUILDER")
+            self.assertIn("builder command is not configured", meta["state_reason"])
 
     def test_stall_detector_flags_stale_active_tasks_and_worker_ledgers(self):
         with tempfile.TemporaryDirectory() as td:

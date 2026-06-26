@@ -181,6 +181,8 @@ Because the PR status monitor intentionally searches only open PRs, `scripts/rec
 
 `DISPATCHED`/`READY_FOR_BUILDER` means the worktree and `builder-prompt.md` exist; it does **not** mean a builder process is running. `scripts/auto-builder-runner.py` is the automatic bridge from approval/dispatch to actual builder execution: it scans ready tasks and runs `scripts/run-builder-worker.py` only when `.automation/builder-config.json` has `enabled=true` plus `builder_command` (or `HERMES_BUILDER_COMMAND` is set). Without that command it fails closed and leaves the card at `READY_FOR_BUILDER`.
 
+`scripts/build-control-autopilot.py` is the top-level deterministic loop for the desired Discord workflow: initial contract approval grants scoped build/draft-PR authority for that plan, then the autopilot decomposes, dispatches, runs the configured builder, publishes readiness-passed draft PRs when publish config allows, and keeps reconciling parent status. It stops only for concrete decisions, missing configuration, readiness failures, or PR-status handoff. The cron wrapper is `bk-build-control-autopilot.sh`.
+
 ## Open plan router and thread replies
 
 `scripts/open-plan-router.py` classifies each open plan into the next safe handler/action. It makes stalled-looking `CONTRACT` plans explicit (`shape_contract`, `agent_required`) and routes `EXECUTING` plans to `scripts/dispatch-pr-worker.py` when the dispatcher exists.

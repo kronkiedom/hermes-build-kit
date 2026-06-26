@@ -59,7 +59,7 @@ def ready_task(repo_root: Path) -> tuple[Path, dict[str, Any]] | None:
             continue
         if not dispatch.get("worktree"):
             continue
-        if state in READY_STATES or phase.get("EXECUTE") == "READY_FOR_BUILDER":
+        if state in READY_STATES or phase.get("EXECUTE") in {"READY_FOR_BUILDER", "DISPATCHED"}:
             return meta_path.parent, meta
     return None
 
@@ -73,7 +73,7 @@ def active_build_tasks(repo_root: Path) -> list[dict[str, Any]]:
         if str(meta.get("state") or "") in ACTIVE_STATES and not meta.get("awaiting_operator"):
             # READY_FOR_BUILDER is represented as DISPATCHED + phase flag, not EXECUTE.
             phase = dict_or_empty(meta.get("phase_status"))
-            if phase.get("EXECUTE") == "READY_FOR_BUILDER":
+            if phase.get("EXECUTE") in {"READY_FOR_BUILDER", "DISPATCHED"}:
                 continue
             active.append({"task_id": meta.get("task_id") or meta_path.parent.name, "state": meta.get("state")})
     return active
