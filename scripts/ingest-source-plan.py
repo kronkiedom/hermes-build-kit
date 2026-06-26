@@ -27,6 +27,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--execute-dispatch", action="store_true", help="Make dispatch mutate task state and create the isolated worktree")
     parser.add_argument("--worktree-root", default=".automation/pr-worktrees")
     parser.add_argument("--force-status-override", action="store_true", help="Override retired/blocked source-plan audit blockers")
+    parser.add_argument("--force-author-override", action="store_true", help="Explicit operator assertion that this source plan was authored by the operator despite missing author metadata")
+    parser.add_argument("--operator-author-alias", action="append", default=None, help="Allowed source-plan author alias; repeatable. Defaults to Dom/domarmor/dom-armor")
     return parser.parse_args()
 
 
@@ -49,6 +51,8 @@ def main() -> None:
         execute_dispatch=args.execute_dispatch,
         worktree_root=args.worktree_root,
         force_status_override=args.force_status_override,
+        force_author_override=args.force_author_override,
+        operator_author_aliases=tuple(args.operator_author_alias or ("Dom", "domarmor", "dom-armor")),
     )
     payload = ingest_source_plan(Path.cwd(), request)
     write_json(Path.cwd() / ".automation" / "status" / "ingest-source-plan-last.json", {**payload, "checked_at": utc_now()})

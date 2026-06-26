@@ -382,6 +382,98 @@ class SourcePlanIngestRequest:
     execute_dispatch: bool = False
     worktree_root: str = ".automation/pr-worktrees"
     force_status_override: bool = False
+    force_author_override: bool = False
+    operator_author_aliases: tuple[str, ...] = ("Dom", "domarmor", "dom-armor")
+
+
+def audit_source_plan_author(markdown: str, *, source_path: str | None = None, allowed_aliases: tuple[str, ...] = ("Dom", "domarmor", "dom-armor"), override: bool = False) -> dict[str, Any]:
+    """Fail-closed author audit for source-plan ingestion.
+
+    Build-control is only allowed to ingest operator-authored planning docs.
+    A missing author line is ambiguous, so it blocks unless the operator records
+    an explicit override/assertion at intake.
+    """
+    lines = markdown.splitlines()
+    aliases = [alias.lower() for alias in allowed_aliases]
+    basis: list[dict[str, Any]] = []
+    blockers: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    matched = False
+
+    author_re = re.compile(r"^\s*(?:\*\*)?(?:from|author|authored by)\s*:\s*(?:\*\*)?\s*(.+)$", re.IGNORECASE)
+    for idx, line in enumerate(lines[:40], start=1):
+        match = author_re.match(line.strip())
+        if not match:
+            continue
+        text = match.group(1).strip()
+        basis.append({"code": "author-line", "line": idx, "text": line.strip()[:240]})
+        low = text.lower()
+        if any(alias in low for alias in aliases):
+            matched = True
+            break
+
+    if matched:
+        status = "OPERATOR_AUTHORED"
+    elif override:
+        status = "OPERATOR_ASSERTED"
+        warnings.append({
+            "kind": "operator_author_override",
+            "severity": "P1",
+            "message": "operator asserted authorship at intake because no matching source author marker was found",
+        })
+    else:
+        status = "UNKNOWN_AUTHOR"
+        blockers.append({
+            "kind": "non_operator_authored_or_unknown_source_plan",
+            "severity": "P1",
+            "message": "source plan lacks a matching operator author marker; build-control only ingests operator-authored plans",
+        })
+
+    return {
+        "kind": "SOURCE-PLAN-AUTHOR-AUDIT",
+        "source_path": source_path,
+        "status": status,
+        "allowed_aliases": list(allowed_aliases),
+        "blockers": blockers,
+        "warnings": warnings,
+        "basis": basis,
+        "audited_at": utc_now(),
+    }
+
+
+def render_source_author_audit_markdown(audit: dict[str, Any]) -> str:
+    rows = [
+        "# Source plan author audit",
+        "",
+        f"- Source: `{audit.get('source_path')}`",
+        f"- Status: `{audit.get('status')}`",
+        f"- Blockers: `{len(audit.get('blockers') or [])}`",
+        "",
+        "## Basis",
+        "",
+    ]
+    basis = audit.get("basis") or []
+    if basis:
+        for item in basis:
+            rows.append(f"- `{item.get('code')}` line {item.get('line')}: {item.get('text')}")
+    else:
+        rows.append("- **None.**")
+    rows.extend(["", "## Blockers", ""])
+    blockers = audit.get("blockers") or []
+    if blockers:
+        for item in blockers:
+            rows.append(f"- **{item.get('severity')}** `{item.get('kind')}` — {item.get('message')}")
+    else:
+        rows.append("- **None.**")
+    rows.extend(["", "## Warnings", ""])
+    warnings = audit.get("warnings") or []
+    if warnings:
+        for item in warnings:
+            rows.append(f"- **{item.get('severity')}** `{item.get('kind')}` — {item.get('message')}")
+    else:
+        rows.append("- **None.**")
+    rows.append("")
+    return "\n".join(rows)
 
 
 def audit_source_plan_status(markdown: str, *, source_path: str | None = None) -> dict[str, Any]:
@@ -615,12 +707,36 @@ def ingest_source_plan(repo_root: Path, request: SourcePlanIngestRequest) -> dic
         "base_branch": request.base_branch,
         "ingested_at": utc_now(),
     })
+    author_audit = audit_source_plan_author(
+        markdown,
+        source_path=str(request.plan_file),
+        allowed_aliases=request.operator_author_aliases,
+        override=request.force_author_override,
+    )
+    write_json(plan_dir / "source-author-audit.json", author_audit)
+    write_text(plan_dir / "source-author-audit.md", render_source_author_audit_markdown(author_audit))
+
     status_audit = audit_source_plan_status(markdown, source_path=str(request.plan_file))
     write_json(plan_dir / "source-status-audit.json", status_audit)
     write_text(plan_dir / "source-status-audit.md", render_source_status_audit_markdown(status_audit))
     readiness_5x5 = build_ingest_5x5_audit(markdown, request, status_audit, repo_root=repo_root)
     write_json(plan_dir / "readiness-5x5-audit.json", readiness_5x5)
     write_text(plan_dir / "readiness-5x5-audit.md", render_5x5_markdown(readiness_5x5))
+
+    author_blockers = author_audit.get("blockers") or []
+    if author_blockers:
+        reason = f"source plan author audit blocked execution: {author_blockers[0].get('kind')}"
+        _update_blocked_plan_after_ingest(repo_root, plan_id, plan_dir, meta, reason)
+        return {
+            "kind": "SOURCE-PLAN-INGEST",
+            "decision": "BLOCKED",
+            "reason": reason,
+            "plan_id": plan_id,
+            "plan_dir": str(plan_dir),
+            "author_audit": author_audit,
+            "status_audit": status_audit,
+            "readiness_5x5": readiness_5x5,
+        }
 
     blockers = status_audit.get("blockers") or []
     if blockers and not request.force_status_override:
@@ -632,6 +748,7 @@ def ingest_source_plan(repo_root: Path, request: SourcePlanIngestRequest) -> dic
             "reason": reason,
             "plan_id": plan_id,
             "plan_dir": str(plan_dir),
+            "author_audit": author_audit,
             "status_audit": status_audit,
             "readiness_5x5": readiness_5x5,
         }
@@ -642,6 +759,7 @@ def ingest_source_plan(repo_root: Path, request: SourcePlanIngestRequest) -> dic
         "decision": "CONTRACT_SHAPED",
         "plan_id": plan_id,
         "plan_dir": str(plan_dir),
+        "author_audit": author_audit,
         "status_audit": status_audit,
         "readiness_5x5": readiness_5x5,
         "contract": contract,

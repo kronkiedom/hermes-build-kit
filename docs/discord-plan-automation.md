@@ -36,7 +36,7 @@ The poller accepts messages only from the configured operator user ID.
    3. writes durable artifacts under `plans/<plan-id>/`;
    4. updates `.automation/plans-index.json`;
    5. posts a short accepted/status message in build-control.
-2. `scripts/ingest-source-plan.py` ingests an existing markdown plan file. It first writes a source-status audit and a 5x5 ingest audit under `plans/<plan-id>/`; retired/superseded/blocked source plans fail closed before decomposition unless the operator passes `--force-status-override`.
+2. `scripts/ingest-source-plan.py` ingests an existing markdown plan file. It first writes a source-author audit, source-status audit, and a 5x5 ingest audit under `plans/<plan-id>/`; plans are fail-closed unless they are operator-authored (`From: Dom`, `Author: Dom`, or configured alias) or the operator records `--force-author-override`. Retired/superseded/blocked source plans also fail closed before decomposition unless the operator passes `--force-status-override`.
 
 The first durable state is `CONTRACT`; execution does not begin until the plan is shaped into a contract.
 

@@ -993,6 +993,7 @@ class PlanAutomationTests(unittest.TestCase):
             source_plan = tmp_path / "retired-plan.md"
             source_plan.write_text(
                 "# Plan → Executable Workflow\n\n"
+                "**From:** Dom\n\n"
                 "## Retired as active plan — 2026-06-25\n\n"
                 "> This document is retained as historical sequencing/audit context only.\n\n"
                 "## Acceptance\n\n- Build the current active work only.\n",
@@ -1028,6 +1029,65 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertIs(meta["awaiting_operator"], True)
             self.assertFalse((tmp_path / "tasks").exists())
 
+    def test_source_plan_ingestion_blocks_missing_or_non_operator_author(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            source_plan = tmp_path / "third-party-plan.md"
+            source_plan.write_text(
+                "# External plan\n\n"
+                "**From:** Drake\n\n"
+                "**Status:** Active — ready.\n\n"
+                "## Done means\n\n- Update docs.\n",
+                encoding="utf-8",
+            )
+
+            result = plan_automation_lib.ingest_source_plan(
+                tmp_path,
+                plan_automation_lib.SourcePlanIngestRequest(
+                    plan_file=source_plan,
+                    repo="/tmp/target-repo",
+                    thread_id="thread-1",
+                    no_discord=True,
+                    auto_approve=True,
+                    decompose=True,
+                ),
+            )
+
+            self.assertEqual(result["decision"], "BLOCKED")
+            self.assertEqual(result["author_audit"]["status"], "UNKNOWN_AUTHOR")
+            self.assertIn("author audit", result["reason"])
+            self.assertFalse((tmp_path / "tasks").exists())
+            plan_dir = Path(result["plan_dir"])
+            self.assertTrue((plan_dir / "source-author-audit.json").exists())
+            meta = json.loads((plan_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["state"], "QUESTION")
+
+    def test_source_plan_ingestion_allows_explicit_operator_author_override(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            source_plan = tmp_path / "legacy-dom-plan.md"
+            source_plan.write_text(
+                "# Legacy Dom-authored plan with no author line\n\n"
+                "**Status:** Active — ready.\n\n"
+                "## Done means\n\n- Update docs.\n",
+                encoding="utf-8",
+            )
+
+            result = plan_automation_lib.ingest_source_plan(
+                tmp_path,
+                plan_automation_lib.SourcePlanIngestRequest(
+                    plan_file=source_plan,
+                    repo="/tmp/target-repo",
+                    thread_id="thread-1",
+                    no_discord=True,
+                    force_author_override=True,
+                ),
+            )
+
+            self.assertEqual(result["decision"], "CONTRACT_SHAPED")
+            self.assertEqual(result["author_audit"]["status"], "OPERATOR_ASSERTED")
+            self.assertEqual(result["author_audit"]["blockers"], [])
+
     def test_source_plan_ingestion_can_approve_decompose_and_dispatch_active_plan(self):
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
@@ -1046,6 +1106,7 @@ class PlanAutomationTests(unittest.TestCase):
             source_plan = tmp_path / "active-plan.md"
             source_plan.write_text(
                 "# Build dashboard polish\n\n"
+                "**From:** Dom\n\n"
                 "**Status:** Active — ready to build.\n\n"
                 "## Done means\n\n"
                 "- Update README docs.\n"
