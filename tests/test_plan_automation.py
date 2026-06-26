@@ -38,6 +38,7 @@ reconcile_plan_progress = load_script_module("reconcile_plan_progress_script", "
 auto_builder_runner = load_script_module("auto_builder_runner_script", "auto-builder-runner.py")
 auto_publish_runner = load_script_module("auto_publish_runner_script", "auto-publish-runner.py")
 pre_pr_rebase_autocure = load_script_module("pre_pr_rebase_autocure_script", "pre-pr-rebase-autocure.py")
+readiness_runner = load_script_module("readiness_runner_script", "readiness-runner.py")
 build_control_autopilot = load_script_module("build_control_autopilot_script", "build-control-autopilot.py")
 
 
@@ -761,6 +762,77 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertEqual(new_job["state"], "READINESS_QUEUED")
             self.assertEqual(new_job["sha"], result["after_sha"])
 
+    def test_readiness_runner_blocks_without_configured_verifier(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            worktree = tmp_path / "worktree"
+            worktree.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=worktree, check=True, text=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=worktree, check=True)
+            (worktree / "README.md").write_text("# demo\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=worktree, check=True, text=True, capture_output=True)
+            sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=worktree, check=True, text=True, capture_output=True).stdout.strip()
+            task_id = "task-readiness-blocked"
+            task_dir = tmp_path / "tasks" / task_id
+            task_dir.mkdir(parents=True)
+            job = create_readiness_job(tmp_path, task_id=task_id, branch="main", sha=sha)
+            (task_dir / "meta.json").write_text(json.dumps({
+                "task_id": task_id,
+                "state": "VERIFYING",
+                "awaiting_operator": False,
+                "dispatch": {"worktree": str(worktree), "branch": "main", "base_branch": "main"},
+                "build": {"commit_sha": sha, "readiness_job_id": job["job_id"]},
+            }), encoding="utf-8")
+
+            result = readiness_runner.run_readiness(tmp_path, execute=True)
+
+            self.assertEqual(result["decision"], "BLOCKED")
+            self.assertIn("readiness verifier is not configured", result["reason"])
+
+    def test_readiness_runner_marks_pr_ready_from_structured_verifier_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            worktree = tmp_path / "worktree"
+            worktree.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=worktree, check=True, text=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=worktree, check=True)
+            (worktree / "README.md").write_text("# demo\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=worktree, check=True, text=True, capture_output=True)
+            sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=worktree, check=True, text=True, capture_output=True).stdout.strip()
+            task_id = "task-readiness-pass"
+            task_dir = tmp_path / "tasks" / task_id
+            task_dir.mkdir(parents=True)
+            job = create_readiness_job(tmp_path, task_id=task_id, branch="main", sha=sha)
+            (task_dir / "meta.json").write_text(json.dumps({
+                "task_id": task_id,
+                "state": "VERIFYING",
+                "awaiting_operator": False,
+                "dispatch": {"worktree": str(worktree), "branch": "main", "base_branch": "main"},
+                "build": {"commit_sha": sha, "readiness_job_id": job["job_id"]},
+            }), encoding="utf-8")
+            verifier = tmp_path / "verifier.py"
+            verifier.write_text(
+                "import json, os\n"
+                "print(json.dumps({'passed': True, 'issues': [], 'evidence': {'job': os.environ['READINESS_JOB_ID'], 'method': 'test-verifier'}}))\n",
+                encoding="utf-8",
+            )
+            (tmp_path / ".automation").mkdir(exist_ok=True)
+            (tmp_path / ".automation" / "readiness-config.json").write_text(json.dumps({"enabled": True, "verifier_command": f"{sys.executable} {verifier}"}), encoding="utf-8")
+
+            result = readiness_runner.run_readiness(tmp_path, execute=True)
+
+            self.assertEqual(result["decision"], "PR_READY")
+            meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["state"], "PR_READY")
+            marked = json.loads((tmp_path / ".automation" / "pr-readiness" / f"{job['job_id']}.json").read_text(encoding="utf-8"))
+            self.assertEqual(marked["state"], "PR_READY")
+            self.assertTrue(marked["passed"])
+            self.assertEqual(marked["evidence"]["method"], "test-verifier")
+
     def test_publish_draft_pr_blocks_until_readiness_passes_for_current_sha(self):
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
@@ -889,6 +961,7 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertIn("decomposed_plan", action_names)
             self.assertIn("dispatch", action_names)
             self.assertIn("pre_pr_rebase_autocure", action_names)
+            self.assertIn("readiness_runner", action_names)
             tasks = list((tmp_path / "tasks").glob("*/meta.json"))
             self.assertEqual(len(tasks), 1)
             meta = json.loads(tasks[0].read_text(encoding="utf-8"))

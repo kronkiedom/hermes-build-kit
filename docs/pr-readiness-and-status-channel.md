@@ -148,6 +148,7 @@ For pre-PR build-control task branches, `scripts/pre-pr-rebase-autocure.py` runs
 ## Recommended live wiring
 
 - `submit_pr_ready` / handoff workflows call `scripts/pr-readiness-gate.py` directly. This is event-based, not cron-based.
-- `scripts/build-control-autopilot.py` runs `scripts/pre-pr-rebase-autocure.py` after builder execution and before `scripts/auto-publish-runner.py`, so a branch that fell behind during verification is rebased and re-audited before any draft PR publish attempt.
+- `scripts/build-control-autopilot.py` runs `scripts/pre-pr-rebase-autocure.py` after builder execution, then `scripts/readiness-runner.py`, then `scripts/auto-publish-runner.py`, so a branch that fell behind during verification is rebased and re-audited before any draft PR publish attempt.
+- `scripts/readiness-runner.py` consumes queued SHA-scoped readiness jobs only when `.automation/readiness-config.json` or `HERMES_READINESS_COMMAND` provides a verifier command. The verifier must emit structured JSON (`passed`, `issues`, `evidence`). Missing config, invalid JSON, stale SHA, dirty/conflicted upstream state, or failed audits all fail closed; no draft PR publish proceeds without a `PR_READY` job for the current SHA.
 - GitHub webhook handling should call `scripts/github-pr-status-monitor.py` or equivalent targeted sync when PR review/comment/check events arrive.
 - A low-frequency cron sweeper may run the monitor as a reconciliation backup so missed webhook events do not hide stale review feedback.
