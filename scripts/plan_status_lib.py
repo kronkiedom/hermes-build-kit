@@ -153,7 +153,7 @@ def format_plan_card(status: dict[str, Any], operator_user_id: str) -> str:
         f"**Needs to complete:** {needs}\n"
         f"**Repo/base:** `{status.get('repo') or 'unknown'}` / `{status.get('base_branch') or 'main'}`"
         f"{question}\n\n"
-        "Reply in this thread to progress the workflow. `approve` approves a contract; otherwise your reply is recorded and moves waiting plans back to contract shaping."
+        "Reply in this thread to progress the workflow. For plan approval, type `approve` with no slash. `/approve` is reserved for Hermes command approvals and may be blocked in build-control. Other replies are recorded and move waiting plans back to contract shaping."
     )[:1900]
 
 

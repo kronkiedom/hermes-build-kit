@@ -62,7 +62,7 @@ def starter_message(meta: dict[str, Any]) -> str:
         f"**Needs to complete:** {needs}\n"
         f"**Branch:** `{packet.get('branch') or meta.get('branch') or 'not assigned'}`\n"
         f"\n{prompt}\n\n"
-        "Reply in this thread to progress the workflow; decision replies are recorded into the task metadata."
+        "Reply in this thread to progress the workflow; decision replies are recorded into the task metadata. Use plain text, not `/approve` (that slash command is Hermes command approval)."
     )[:1900]
 
 

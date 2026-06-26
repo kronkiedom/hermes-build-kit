@@ -183,7 +183,7 @@ Because the PR status monitor intentionally searches only open PRs, `scripts/rec
 
 `scripts/open-plan-status-monitor.py` keeps each active plan thread grounded with a persistent plan card. The card is posted once and then edited as state changes; it summarizes the plan, where it is, what must happen to complete it, and any decision/reply needed. It also adds the operator as a thread member when possible so bot-created threads are visible in Discord.
 
-`scripts/discord-plan-thread-poller.py` polls active plan threads for operator replies. Replies in `QUESTION` move the plan back to `CONTRACT`; replies in `CONTRACT_REVIEW` can approve/reject/cancel the contract. The same poller also watches child task/decision threads: an operator reply is recorded into task metadata, clears `awaiting_operator`, and moves decision tasks out of `QUESTION` so build-control can continue routing.
+`scripts/discord-plan-thread-poller.py` polls active plan threads for operator replies. Replies in `QUESTION` move the plan back to `CONTRACT`; plain-text `approve` (no slash) / `reject` / `cancel` replies in `CONTRACT_REVIEW` approve/reject/cancel the contract. The same poller also watches child task/decision threads: an operator reply is recorded into task metadata, clears `awaiting_operator`, and moves decision tasks out of `QUESTION` so build-control can continue routing. Do not use `/approve` for plan approval: Discord routes that to Hermes dangerous-command approval, not build-control, and build-control channels may be ignored by the Hermes gateway.
 
 ## Open plan status monitor
 

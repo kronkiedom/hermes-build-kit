@@ -164,7 +164,7 @@ def create_plan_intake(repo_root: Path, request: IntakeRequest) -> dict[str, Any
             f"**Where it is:** intake accepted; ready for contract shaping\n"
             f"**Needs to complete:** shape contract, approve scope, decompose into build/decision packets, verify, and hand off PRs.\n"
             f"**Repo/base:** `{request.repo}` / `{request.base_branch}`\n\n"
-            "Reply in this thread to progress the workflow. If a decision is requested, answer it here; `approve` approves a contract review."
+            "Reply in this thread to progress the workflow. For plan approval, type `approve` with no slash. `/approve` is reserved for Hermes command approvals and may be blocked in build-control."
         )
         thread_id, starter_message_id = create_discord_thread(
             request.discord_token, request.control_channel_id, thread_title, starter
