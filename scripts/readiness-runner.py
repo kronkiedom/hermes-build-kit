@@ -96,6 +96,39 @@ def parse_verifier_result(stdout: str) -> dict[str, Any] | None:
     return None
 
 
+def format_readiness_feedback(marked_job: dict[str, Any]) -> str:
+    issues_raw = marked_job.get("issues")
+    issues: list[Any] = issues_raw if isinstance(issues_raw, list) else []
+    lines = [
+        "## Readiness feedback — continue building",
+        "",
+        f"Readiness job `{marked_job.get('job_id')}` failed for SHA `{marked_job.get('sha')}`.",
+        "Address every blocking issue below before the next PR-ready attempt.",
+        "",
+    ]
+    if not issues:
+        lines.append("- No structured issues were returned; inspect readiness command output.")
+    for idx, issue in enumerate(issues, start=1):
+        if not isinstance(issue, dict):
+            lines.append(f"{idx}. Invalid issue payload: `{issue}`")
+            continue
+        lines.extend([
+            f"{idx}. **{issue.get('severity') or 'P1'} {issue.get('kind') or 'readiness_issue'}** — {issue.get('message') or 'No message provided.'}",
+            f"   - Evidence: {issue.get('evidence') or issue.get('command_output_path') or 'not provided'}",
+        ])
+    return "\n".join(lines).strip() + "\n"
+
+
+def write_readiness_feedback(task_dir: Path, marked_job: dict[str, Any]) -> None:
+    feedback = format_readiness_feedback(marked_job)
+    (task_dir / "readiness-feedback.md").write_text(feedback, encoding="utf-8")
+    prompt_path = task_dir / "builder-prompt.md"
+    existing = prompt_path.read_text(encoding="utf-8") if prompt_path.exists() else ""
+    marker = "\n## Readiness feedback — continue building\n"
+    base = existing.split(marker, 1)[0].rstrip() if marker in existing else existing.rstrip()
+    prompt_path.write_text(f"{base}\n\n{feedback}", encoding="utf-8")
+
+
 def update_task(task_dir: Path, meta: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
     updated = {**meta, **updates, "updated_at": utc_now()}
     write_json(task_dir / "meta.json", updated)
@@ -154,6 +187,7 @@ def run_readiness(repo_root: Path, *, execute: bool = False, task_id: str | None
         reason = "readiness verifier did not return structured JSON with boolean `passed`; manual attention required"
         issue = {"kind": "invalid_readiness_verifier_output", "severity": "P1", "message": reason, "command_output_path": str(command_output_path)}
         marked = mark_readiness_result(repo_root, str(job["job_id"]), passed=False, issues=[issue], evidence={"command_output_path": str(command_output_path)})
+        write_readiness_feedback(task_dir, marked)
         update_task(task_dir, meta, {"awaiting_operator": True, "state": "VERIFYING", "state_reason": reason})
         return {"kind": "READINESS-RUNNER", "decision": "BLOCKED", "task_id": selected_task_id, "job_id": job.get("job_id"), "reason": reason, "readiness": {"state": marked.get("state"), "passed": marked.get("passed")}}
 
@@ -175,6 +209,7 @@ def run_readiness(repo_root: Path, *, execute: bool = False, task_id: str | None
         })
         decision = "PR_READY"
     else:
+        write_readiness_feedback(task_dir, marked)
         update_task(task_dir, meta, {
             "state": "READY_FOR_BUILDER",
             "phase_status": {**dict_or_empty(meta.get("phase_status")), "VERIFY": "FAILED", "EXECUTE": "READY_FOR_BUILDER"},

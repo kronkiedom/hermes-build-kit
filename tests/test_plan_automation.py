@@ -833,6 +833,50 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertTrue(marked["passed"])
             self.assertEqual(marked["evidence"]["method"], "test-verifier")
 
+    def test_readiness_runner_writes_failed_issues_into_next_builder_prompt(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            worktree = tmp_path / "worktree"
+            worktree.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=worktree, check=True, text=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=worktree, check=True)
+            (worktree / "README.md").write_text("# demo\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=worktree, check=True, text=True, capture_output=True)
+            sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=worktree, check=True, text=True, capture_output=True).stdout.strip()
+            task_id = "task-readiness-fail"
+            task_dir = tmp_path / "tasks" / task_id
+            task_dir.mkdir(parents=True)
+            (task_dir / "builder-prompt.md").write_text("# Original builder prompt\n", encoding="utf-8")
+            job = create_readiness_job(tmp_path, task_id=task_id, branch="main", sha=sha)
+            (task_dir / "meta.json").write_text(json.dumps({
+                "task_id": task_id,
+                "state": "VERIFYING",
+                "awaiting_operator": False,
+                "dispatch": {"worktree": str(worktree), "branch": "main", "base_branch": "main"},
+                "build": {"commit_sha": sha, "readiness_job_id": job["job_id"]},
+            }), encoding="utf-8")
+            verifier = tmp_path / "verifier.py"
+            verifier.write_text(
+                "import json\n"
+                "print(json.dumps({'passed': False, 'issues': [{'kind': 'regression', 'severity': 'P0', 'message': 'fix the runtime path', 'evidence': 'probe failed'}], 'evidence': {'method': 'test-verifier'}}))\n",
+                encoding="utf-8",
+            )
+            (tmp_path / ".automation").mkdir(exist_ok=True)
+            (tmp_path / ".automation" / "readiness-config.json").write_text(json.dumps({"enabled": True, "verifier_command": f"{sys.executable} {verifier}"}), encoding="utf-8")
+
+            result = readiness_runner.run_readiness(tmp_path, execute=True)
+
+            self.assertEqual(result["decision"], "READINESS_FAILED")
+            meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["state"], "READY_FOR_BUILDER")
+            prompt = (task_dir / "builder-prompt.md").read_text(encoding="utf-8")
+            self.assertIn("Readiness feedback", prompt)
+            self.assertIn("fix the runtime path", prompt)
+            self.assertIn("probe failed", prompt)
+            self.assertTrue((task_dir / "readiness-feedback.md").exists())
+
     def test_publish_draft_pr_blocks_until_readiness_passes_for_current_sha(self):
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
