@@ -1461,8 +1461,8 @@ class PlanAutomationTests(unittest.TestCase):
                 "source_plan_id": plan_id,
                 "state": "QUESTION",
                 "awaiting_operator": True,
-                "pr_packet": {"kind": "decision_required", "packet_id": "decision-1"},
-                "discord": {"thread_id": "thread-task"},
+                "phase_status": {"DECISION": "NEEDS_OPERATOR"},
+                "pr_packet": {"kind": "decision_required", "packet_id": "decision-1", "awaiting_operator": True, "status": "blocked"},
             }), encoding="utf-8")
 
             result = plan_thread_poller.handle_operator_reply(tmp_path, {"plan_id": plan_id, "plan_dir": str(plan_dir), "state": "EXECUTING"}, {
@@ -1478,6 +1478,9 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertEqual(meta["state"], "SHAPE")
             self.assertFalse(meta["awaiting_operator"])
             self.assertIn("operator_decision", meta)
+            self.assertEqual(meta["phase_status"]["DECISION"], "ANSWERED")
+            self.assertFalse(meta["pr_packet"]["awaiting_operator"])
+            self.assertEqual(meta["pr_packet"]["status"], "answered")
 
     def test_bare_approval_does_not_satisfy_concrete_decision_task(self):
         with tempfile.TemporaryDirectory() as td:

@@ -86,9 +86,10 @@ def active_thread_tasks(repo_root: Path) -> list[dict[str, Any]]:
         thread_id = str(discord.get("thread_id") or "")
         if not thread_id:
             continue
-        # Poll every operator-waiting task thread, plus explicit decision-required packets.
-        packet = meta.get("pr_packet") if isinstance(meta.get("pr_packet"), dict) else {}
-        if not meta.get("awaiting_operator") and packet.get("kind") != "decision_required":
+        # Poll every operator-waiting task thread, plus decision packets that are still asking a question.
+        packet_raw = meta.get("pr_packet")
+        packet: dict[str, Any] = packet_raw if isinstance(packet_raw, dict) else {}
+        if not meta.get("awaiting_operator") and not (packet.get("kind") == "decision_required" and state == "QUESTION"):
             continue
         out.append({**meta, "task_dir": str(meta_path.parent), "thread_id": thread_id})
     return out
@@ -165,11 +166,12 @@ def find_active_child_operator_tasks(repo_root: Path, plan_id: str) -> list[dict
             continue
         if str(meta.get("source_plan_id") or "") != plan_id:
             continue
-        if str(meta.get("state") or "") in {"DONE", "CANCELLED"}:
+        state = str(meta.get("state") or "")
+        if state in {"DONE", "CANCELLED"}:
             continue
         packet_raw = meta.get("pr_packet")
         packet: dict[str, Any] = packet_raw if isinstance(packet_raw, dict) else {}
-        if meta.get("awaiting_operator") or packet.get("kind") == "decision_required":
+        if meta.get("awaiting_operator") or (packet.get("kind") == "decision_required" and state == "QUESTION"):
             out.append({**meta, "task_dir": str(meta_path.parent)})
     return out
 
@@ -212,6 +214,12 @@ def handle_operator_task_reply(repo_root: Path, task: dict[str, Any], message: d
     meta["operator_decision"] = reply
     meta["awaiting_operator"] = False
     meta["decision_answered_at"] = reply["ingested_at"]
+    if isinstance(meta.get("phase_status"), dict):
+        meta["phase_status"]["DECISION"] = "ANSWERED"
+    packet["awaiting_operator"] = False
+    if packet.get("kind") == "decision_required":
+        packet["status"] = "answered"
+    meta["pr_packet"] = packet
     if str(meta.get("state")) == "QUESTION":
         meta["state"] = "SHAPE"
     meta["state_reason"] = "operator reply ingested from task thread; ready for next build-control action"
