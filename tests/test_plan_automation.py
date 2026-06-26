@@ -968,6 +968,18 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertEqual(meta["state"], "READY_FOR_BUILDER")
             self.assertIn("builder command is not configured", meta["state_reason"])
 
+    def test_build_control_autopilot_holds_when_lock_exists(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            lock_dir = tmp_path / ".automation" / "locks" / "build-control-autopilot.lock"
+            lock_dir.mkdir(parents=True)
+
+            result = build_control_autopilot.advance_build_control(tmp_path, execute=True)
+
+            self.assertEqual(result["decision"], "HOLD")
+            self.assertIn("already active", result["reason"])
+            self.assertTrue(lock_dir.exists())
+
     def test_stall_detector_flags_stale_active_tasks_and_worker_ledgers(self):
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)

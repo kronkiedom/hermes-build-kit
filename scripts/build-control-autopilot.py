@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -54,7 +55,41 @@ def decompose_ready_plans(repo_root: Path, *, execute: bool) -> list[dict[str, A
     return actions
 
 
+def acquire_autopilot_lock(repo_root: Path) -> tuple[bool, Path]:
+    lock_dir = repo_root / ".automation" / "locks" / "build-control-autopilot.lock"
+    lock_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lock_dir.mkdir()
+        write_json(lock_dir / "owner.json", {"kind": "BUILD-CONTROL-AUTOPILOT-LOCK", "acquired_at": utc_now()})
+        return True, lock_dir
+    except FileExistsError:
+        return False, lock_dir
+
+
+def release_autopilot_lock(lock_dir: Path) -> None:
+    if lock_dir.exists():
+        shutil.rmtree(lock_dir, ignore_errors=True)
+
+
 def advance_build_control(repo_root: Path, *, execute: bool = False) -> dict[str, Any]:
+    locked, lock_dir = acquire_autopilot_lock(repo_root)
+    if not locked:
+        return {
+            "kind": "BUILD-CONTROL-AUTOPILOT",
+            "checked_at": utc_now(),
+            "execute": execute,
+            "action_count": 0,
+            "decision": "HOLD",
+            "reason": "another build-control autopilot run is already active",
+            "lock_dir": str(lock_dir),
+        }
+    try:
+        return _advance_build_control_locked(repo_root, execute=execute)
+    finally:
+        release_autopilot_lock(lock_dir)
+
+
+def _advance_build_control_locked(repo_root: Path, *, execute: bool = False) -> dict[str, Any]:
     dispatch_worker = load_script("dispatch_pr_worker_script", "dispatch-pr-worker.py")
     reconciler = load_script("reconcile_plan_progress_script", "reconcile-plan-progress.py")
     auto_builder = load_script("auto_builder_runner_script", "auto-builder-runner.py")
