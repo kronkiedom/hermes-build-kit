@@ -14,7 +14,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from plan_automation_lib import read_json, utc_now, write_json
+from plan_automation_lib import read_json, utc_now, write_json, write_text
 from pr_readiness_lib import create_readiness_job
 
 ELIGIBLE_STATES = {"VERIFYING", "PR_READY"}
@@ -157,10 +157,37 @@ def autocure_pre_pr_rebase(repo_root: Path, *, execute: bool = False, task_id: s
         return event
 
     after_sha = current_sha(worktree)
+    changed_files_after = sorted(changed_file_set(worktree, f"origin/{base_branch}...HEAD"))
+    diff_stat = run(["git", "diff", "--stat", f"origin/{base_branch}...HEAD"], cwd=worktree, check=True)
     # Root cause: base can advance after a build, making the old readiness job certify
-    # the wrong SHA; rebase must queue a fresh readiness job before publishing.
+    # the wrong SHA; rebase must queue a fresh readiness job before publishing and
+    # refresh task evidence so artifact-existence checks do not fail on stale SHAs.
     new_job = create_readiness_job(repo_root, task_id=selected_task_id, branch=branch, sha=after_sha)
-    build = {**build, "commit_sha": after_sha, "readiness_job_id": new_job["job_id"], "rebased_from_sha": before_sha, "rebased_at": utc_now()}
+    build = {
+        **build,
+        "commit_sha": after_sha,
+        "readiness_job_id": new_job["job_id"],
+        "rebased_from_sha": before_sha,
+        "rebased_at": utc_now(),
+        "changed_files": changed_files_after,
+    }
+    evidence_path = Path(str(build.get("evidence_path") or task_dir / "build-evidence.json"))
+    summary_path = Path(str(build.get("summary_path") or task_dir / "builder-summary.md"))
+    write_json(evidence_path, {
+        "kind": "BUILDER-EVIDENCE",
+        "task_id": selected_task_id,
+        "before_sha": before_sha,
+        "after_sha": after_sha,
+        "changed_files": changed_files_after,
+        "diff_stat": diff_stat["stdout"],
+        "readiness_job_id": new_job["job_id"],
+        "rebased_from_sha": before_sha,
+        "timestamp": utc_now(),
+        "note": "evidence refreshed after pre-PR rebase autocure",
+    })
+    write_text(summary_path, f"# Builder summary\n\n- Task: `{selected_task_id}`\n- Worktree: `{worktree}`\n- Commit: `{after_sha}`\n- Changed files: `{len(changed_files_after)}`\n- Readiness job: `{new_job['job_id']}`\n- Rebased from: `{before_sha}`\n\n## Diff stat\n\n```text\n{diff_stat['stdout']}```\n")
+    build["evidence_path"] = str(evidence_path)
+    build["summary_path"] = str(summary_path)
     update_task(task_dir, meta, {
         "state": "VERIFYING",
         "awaiting_operator": False,

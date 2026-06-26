@@ -25,6 +25,17 @@ def dict_or_empty(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def is_builder_eligible(meta: dict[str, Any]) -> bool:
+    """Return true only for states this worker can actually execute."""
+    state = str(meta.get("state") or "")
+    dispatch = dict_or_empty(meta.get("dispatch"))
+    if meta.get("awaiting_operator"):
+        return False
+    if not dispatch.get("worktree"):
+        return False
+    return state in BUILDABLE_STATES
+
+
 def run(cmd: list[str], *, cwd: Path | None = None, check: bool = False) -> dict[str, Any]:
     result = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, check=False)
     payload = {"cmd": cmd, "cwd": str(cwd) if cwd else None, "returncode": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
@@ -59,9 +70,7 @@ def load_task(repo_root: Path, task_id: str | None) -> tuple[Path, dict[str, Any
             continue
         if task_id and meta.get("task_id") != task_id and meta_path.parent.name != task_id:
             continue
-        state = str(meta.get("state") or "")
-        dispatch = dict_or_empty(meta.get("dispatch"))
-        if state in BUILDABLE_STATES and dispatch.get("worktree"):
+        if is_builder_eligible(meta):
             candidates.append((meta_path.parent, meta))
     if task_id:
         return candidates[0] if candidates else None
@@ -172,6 +181,57 @@ def run_builder(
 
     changed_files = git_changed_files(worktree)
     if not changed_files:
+        previous_build = dict_or_empty(meta.get("build"))
+        # Root cause: after a failed readiness pass, the next builder may have no
+        # code changes left to make; that should re-run/readiness-check the
+        # existing built SHA, not lock the parent plan waiting on the operator.
+        if previous_build.get("commit_sha"):
+            readiness = create_readiness_job(repo_root, task_id=selected_task_id, branch=str(dispatch.get("branch") or ""), sha=before_sha)
+            base_branch = str(dispatch.get("base_branch") or "main")
+            diff_stat = run(["git", "diff", "--stat", f"origin/{base_branch}...HEAD"], cwd=worktree, check=False)
+            changed_since_base = run(["git", "diff", "--name-only", f"origin/{base_branch}...HEAD"], cwd=worktree, check=False)
+            refreshed_files = [line.strip() for line in str(changed_since_base.get("stdout") or "").splitlines() if line.strip()]
+            build = {
+                **previous_build,
+                "commit_sha": before_sha,
+                "readiness_job_id": readiness["job_id"],
+                "requeued_without_changes_at": utc_now(),
+                "changed_files": refreshed_files or previous_build.get("changed_files", []),
+            }
+            payload = {
+                "kind": "BUILDER-WORKER",
+                "decision": "NO_CHANGES_READINESS_REQUEUED",
+                "task_id": selected_task_id,
+                "reason": "builder command produced no git changes; readiness requeued for existing built SHA",
+                "commit_sha": before_sha,
+                "readiness_job_id": readiness["job_id"],
+            }
+            evidence_path = Path(str(build.get("evidence_path") or task_dir / "build-evidence.json"))
+            summary_path = Path(str(build.get("summary_path") or task_dir / "builder-summary.md"))
+            write_json(evidence_path, {
+                "kind": "BUILDER-EVIDENCE",
+                "task_id": selected_task_id,
+                "before_sha": previous_build.get("commit_sha"),
+                "after_sha": before_sha,
+                "changed_files": build["changed_files"],
+                "diff_stat": diff_stat.get("stdout") or "",
+                "readiness_job_id": readiness["job_id"],
+                "timestamp": utc_now(),
+                "note": "evidence refreshed after no-change builder retry",
+            })
+            write_text(summary_path, f"# Builder summary\n\n- Task: `{selected_task_id}`\n- Worktree: `{worktree}`\n- Commit: `{before_sha}`\n- Changed files: `{len(build['changed_files'])}`\n- Readiness job: `{readiness['job_id']}`\n- Note: builder command produced no new git changes; evidence was refreshed for the existing built SHA.\n\n## Diff stat\n\n```text\n{diff_stat.get('stdout') or ''}```\n")
+            build["evidence_path"] = str(evidence_path)
+            build["summary_path"] = str(summary_path)
+            write_text(task_dir / "builder-noop.md", f"# Builder no-op\n\n- Task: `{selected_task_id}`\n- Reason: builder command produced no git changes; readiness requeued for existing built SHA.\n- Commit: `{before_sha}`\n- Readiness job: `{readiness['job_id']}`\n")
+            update_task_state(task_dir, meta, {
+                "state": "VERIFYING",
+                "phase_status": {**dict_or_empty(meta.get("phase_status")), "EXECUTE": "BUILT", "VERIFY": "QUEUED"},
+                "awaiting_operator": False,
+                "state_reason": "builder produced no new code changes; readiness requeued for existing built SHA",
+                "build": build,
+            })
+            append_build_ledger(repo_root, {**payload, "timestamp": utc_now()})
+            return payload
         payload = {"kind": "BUILDER-WORKER", "decision": "BLOCKED", "task_id": selected_task_id, "reason": "builder command produced no git changes", "before_sha": before_sha}
         write_text(task_dir / "builder-summary.md", f"# Builder blocked\n\n- Task: `{selected_task_id}`\n- Reason: builder command produced no git changes\n")
         update_task_state(task_dir, meta, {"state": "ESCALATED", "awaiting_operator": True, "state_reason": payload["reason"], "build_blocker": payload})

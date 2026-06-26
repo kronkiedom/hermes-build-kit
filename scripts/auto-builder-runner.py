@@ -48,18 +48,12 @@ def configured_builder_command(repo_root: Path) -> str:
 
 
 def ready_task(repo_root: Path) -> tuple[Path, dict[str, Any]] | None:
+    run_builder_worker = load_run_builder_worker()
     for meta_path in task_meta_paths(repo_root):
         meta = read_json(meta_path, {})
         if not isinstance(meta, dict):
             continue
-        state = str(meta.get("state") or "")
-        phase = dict_or_empty(meta.get("phase_status"))
-        dispatch = dict_or_empty(meta.get("dispatch"))
-        if meta.get("awaiting_operator"):
-            continue
-        if not dispatch.get("worktree"):
-            continue
-        if state in READY_STATES or phase.get("EXECUTE") in {"READY_FOR_BUILDER", "DISPATCHED"}:
+        if run_builder_worker.is_builder_eligible(meta):
             return meta_path.parent, meta
     return None
 

@@ -643,6 +643,61 @@ class PlanAutomationTests(unittest.TestCase):
             readiness_job = tmp_path / ".automation" / "pr-readiness" / f"{meta['build']['readiness_job_id']}.json"
             self.assertTrue(readiness_job.exists())
 
+    def test_run_builder_worker_requeues_readiness_when_built_task_has_no_new_changes(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            target_repo = tmp_path / "target-repo"
+            target_repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=target_repo, check=True, text=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=target_repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=target_repo, check=True)
+            (target_repo / "README.md").write_text("# demo\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=target_repo, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=target_repo, check=True, text=True, capture_output=True)
+            subprocess.run(["git", "remote", "add", "origin", str(target_repo)], cwd=target_repo, check=True)
+
+            task_id = "task-noop-built"
+            task_dir = tmp_path / "tasks" / task_id
+            task_dir.mkdir(parents=True)
+            worktree = tmp_path / "worktree"
+            subprocess.run(["git", "clone", str(target_repo), str(worktree)], check=True, text=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=worktree, check=True)
+            subprocess.run(["git", "checkout", "-b", "feat/noop-built"], cwd=worktree, check=True, text=True, capture_output=True)
+            (worktree / "BUILT.md").write_text("already built\n", encoding="utf-8")
+            subprocess.run(["git", "add", "BUILT.md"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "feat: already built"], cwd=worktree, check=True, text=True, capture_output=True)
+            sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=worktree, check=True, text=True, capture_output=True).stdout.strip()
+            job = create_readiness_job(tmp_path, task_id=task_id, branch="feat/noop-built", sha=sha)
+            (task_dir / "builder-prompt.md").write_text("# no-op retry\n", encoding="utf-8")
+            (task_dir / "meta.json").write_text(json.dumps({
+                "task_id": task_id,
+                "state": "READY_FOR_BUILDER",
+                "awaiting_operator": False,
+                "phase_status": {"EXECUTE": "READY_FOR_BUILDER", "VERIFY": "FAILED"},
+                "dispatch": {"worktree": str(worktree), "branch": "feat/noop-built", "base_branch": "main"},
+                "build": {"commit_sha": sha, "readiness_job_id": job["job_id"]},
+            }), encoding="utf-8")
+            command = f"{sys.executable} -c \"print('nothing to change')\""
+
+            result = run_builder_worker.run_builder(tmp_path, task_id=task_id, builder_command=command)
+
+            self.assertEqual(result["decision"], "NO_CHANGES_READINESS_REQUEUED")
+            meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["state"], "VERIFYING")
+            self.assertFalse(meta["awaiting_operator"])
+            self.assertEqual(meta["phase_status"]["VERIFY"], "QUEUED")
+            self.assertEqual(meta["build"]["commit_sha"], sha)
+            self.assertEqual(meta["build"]["readiness_job_id"], job["job_id"])
+            requeued_job = json.loads((tmp_path / ".automation" / "pr-readiness" / f"{meta['build']['readiness_job_id']}.json").read_text(encoding="utf-8"))
+            self.assertEqual(requeued_job["state"], "READINESS_QUEUED")
+            evidence = json.loads((task_dir / "build-evidence.json").read_text(encoding="utf-8"))
+            self.assertEqual(evidence["after_sha"], sha)
+            self.assertEqual(evidence["readiness_job_id"], job["job_id"])
+            self.assertIn("evidence refreshed after no-change builder retry", evidence["note"])
+            summary = (task_dir / "builder-summary.md").read_text(encoding="utf-8")
+            self.assertIn(sha, summary)
+
     def test_auto_builder_blocks_ready_task_without_configured_command(self):
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
@@ -666,6 +721,76 @@ class PlanAutomationTests(unittest.TestCase):
             meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["state"], "READY_FOR_BUILDER")
             self.assertIn("builder command is not configured", meta["state_reason"])
+
+    def test_auto_builder_uses_run_builder_worker_eligibility(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            stale_dir = tmp_path / "tasks" / "task-aaa-stale-phase"
+            ready_dir = tmp_path / "tasks" / "task-ready"
+            stale_wt = tmp_path / "wt-stale"
+            ready_wt = tmp_path / "wt-ready"
+            stale_dir.mkdir(parents=True)
+            ready_dir.mkdir(parents=True)
+            stale_wt.mkdir()
+            ready_wt.mkdir()
+            (stale_dir / "meta.json").write_text(json.dumps({
+                "task_id": "task-stale-phase",
+                "state": "SHAPE",
+                "awaiting_operator": False,
+                "phase_status": {"EXECUTE": "READY_FOR_BUILDER"},
+                "dispatch": {"worktree": str(stale_wt), "branch": "feat/stale"},
+            }), encoding="utf-8")
+            (ready_dir / "meta.json").write_text(json.dumps({
+                "task_id": "task-ready",
+                "state": "READY_FOR_BUILDER",
+                "awaiting_operator": False,
+                "phase_status": {"EXECUTE": "READY_FOR_BUILDER"},
+                "dispatch": {"worktree": str(ready_wt), "branch": "feat/ready"},
+            }), encoding="utf-8")
+
+            selected = auto_builder_runner.ready_task(tmp_path)
+
+            self.assertIsNotNone(selected)
+            self.assertEqual(selected[1]["task_id"], "task-ready")
+
+    def test_plan_progress_normalizes_nonwaiting_escalated_ready_builder_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            plan_id = "plan-normalize"
+            plan_dir = tmp_path / "plans" / plan_id
+            task_dir = tmp_path / "tasks" / "task-escalated-ready"
+            (tmp_path / ".automation").mkdir(parents=True)
+            plan_dir.mkdir(parents=True)
+            task_dir.mkdir(parents=True)
+            (tmp_path / ".automation" / "plans-index.json").write_text(json.dumps({"plans": {plan_id: {
+                "plan_id": plan_id,
+                "plan_dir": str(plan_dir),
+                "state": "EXECUTING",
+            }}}), encoding="utf-8")
+            (plan_dir / "meta.json").write_text(json.dumps({
+                "plan_id": plan_id,
+                "title": "Normalize stale child state",
+                "state": "EXECUTING",
+            }), encoding="utf-8")
+            (task_dir / "meta.json").write_text(json.dumps({
+                "task_id": "task-escalated-ready",
+                "source_plan_id": plan_id,
+                "state": "ESCALATED",
+                "awaiting_operator": False,
+                "phase_status": {"DECISION": "ANSWERED", "EXECUTE": "READY_FOR_BUILDER", "VERIFY": "FAILED"},
+                "dispatch": {"worktree": str(tmp_path / "worktree"), "branch": "feat/normalize"},
+                "state_reason": "operator reply ingested from task thread; ready for next build-control action",
+            }), encoding="utf-8")
+
+            result = reconcile_plan_progress.reconcile_plan_progress(tmp_path)
+
+            self.assertIn("normalized_builder_ready_task", {a["action"] for a in result["actions"]})
+            task_meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(task_meta["state"], "READY_FOR_BUILDER")
+            self.assertFalse(task_meta["awaiting_operator"])
+            self.assertEqual(task_meta["phase_status"]["EXECUTE"], "READY_FOR_BUILDER")
+            plan_meta = json.loads((plan_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertIn("task-escalated-ready is READY_FOR_BUILDER", plan_meta["state_reason"])
 
     def test_auto_builder_runs_configured_command_for_ready_task(self):
         with tempfile.TemporaryDirectory() as td:
@@ -761,6 +886,13 @@ class PlanAutomationTests(unittest.TestCase):
             new_job = json.loads(new_job_path.read_text(encoding="utf-8"))
             self.assertEqual(new_job["state"], "READINESS_QUEUED")
             self.assertEqual(new_job["sha"], result["after_sha"])
+            evidence = json.loads((task_dir / "build-evidence.json").read_text(encoding="utf-8"))
+            self.assertEqual(evidence["after_sha"], result["after_sha"])
+            self.assertEqual(evidence["readiness_job_id"], result["readiness_job_id"])
+            self.assertIn("evidence refreshed after pre-PR rebase autocure", evidence["note"])
+            summary = (task_dir / "builder-summary.md").read_text(encoding="utf-8")
+            self.assertIn(result["after_sha"], summary)
+            self.assertIn(result["readiness_job_id"], summary)
 
     def test_readiness_runner_blocks_without_configured_verifier(self):
         with tempfile.TemporaryDirectory() as td:
