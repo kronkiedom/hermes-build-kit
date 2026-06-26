@@ -179,6 +179,8 @@ Because the PR status monitor intentionally searches only open PRs, `scripts/rec
 
 `scripts/reconcile-plan-progress.py` closes the parent-plan lifecycle loop: it scans child tasks by `source_plan_id`, promotes answered decision packets to dispatch-ready, updates parent plan state/reason from active child progress, writes a contained workflow/PR map into parent metadata, and marks the parent `DONE` once every child task is terminal. The cron wrapper is `bk-plan-progress-reconciler.sh`.
 
+`DISPATCHED`/`READY_FOR_BUILDER` means the worktree and `builder-prompt.md` exist; it does **not** mean a builder process is running. `scripts/auto-builder-runner.py` is the automatic bridge from approval/dispatch to actual builder execution: it scans ready tasks and runs `scripts/run-builder-worker.py` only when `.automation/builder-config.json` has `enabled=true` plus `builder_command` (or `HERMES_BUILDER_COMMAND` is set). Without that command it fails closed and leaves the card at `READY_FOR_BUILDER`.
+
 ## Open plan router and thread replies
 
 `scripts/open-plan-router.py` classifies each open plan into the next safe handler/action. It makes stalled-looking `CONTRACT` plans explicit (`shape_contract`, `agent_required`) and routes `EXECUTING` plans to `scripts/dispatch-pr-worker.py` when the dispatcher exists.

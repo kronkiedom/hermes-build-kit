@@ -18,7 +18,7 @@ from typing import Any
 from plan_automation_lib import read_json, utc_now, write_json, write_text
 from pr_readiness_lib import create_readiness_job
 
-BUILDABLE_STATES = {"EXECUTE", "DISPATCHED"}
+BUILDABLE_STATES = {"EXECUTE", "DISPATCHED", "READY_FOR_BUILDER"}
 
 
 def dict_or_empty(value: Any) -> dict[str, Any]:

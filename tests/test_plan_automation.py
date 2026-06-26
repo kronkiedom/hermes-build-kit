@@ -35,6 +35,7 @@ render_dashboard = load_script_module("render_dashboard_script", "render-dashboa
 ensure_build_threads = load_script_module("ensure_build_threads_script", "ensure-build-threads.py")
 reconcile_merged_prs = load_script_module("reconcile_merged_prs_script", "reconcile-merged-prs.py")
 reconcile_plan_progress = load_script_module("reconcile_plan_progress_script", "reconcile-plan-progress.py")
+auto_builder_runner = load_script_module("auto_builder_runner_script", "auto-builder-runner.py")
 
 
 def run_script(repo: Path, *args: str) -> subprocess.CompletedProcess:
@@ -637,6 +638,74 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertIn("BUILD_OUTPUT.md", "\n".join(evidence["changed_files"]))
             readiness_job = tmp_path / ".automation" / "pr-readiness" / f"{meta['build']['readiness_job_id']}.json"
             self.assertTrue(readiness_job.exists())
+
+    def test_auto_builder_blocks_ready_task_without_configured_command(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            task_id = "task-ready-builder"
+            task_dir = tmp_path / "tasks" / task_id
+            worktree = tmp_path / "worktree"
+            task_dir.mkdir(parents=True)
+            worktree.mkdir()
+            (task_dir / "builder-prompt.md").write_text("build this\n", encoding="utf-8")
+            (task_dir / "meta.json").write_text(json.dumps({
+                "task_id": task_id,
+                "state": "DISPATCHED",
+                "awaiting_operator": False,
+                "phase_status": {"EXECUTE": "READY_FOR_BUILDER"},
+                "dispatch": {"worktree": str(worktree), "branch": "feat/ready"},
+            }), encoding="utf-8")
+
+            result = auto_builder_runner.auto_run_builder(tmp_path, execute=True)
+
+            self.assertEqual(result["decision"], "BLOCKED")
+            meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["state"], "READY_FOR_BUILDER")
+            self.assertIn("builder command is not configured", meta["state_reason"])
+
+    def test_auto_builder_runs_configured_command_for_ready_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            target_repo = tmp_path / "target-repo"
+            target_repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=target_repo, check=True, text=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=target_repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=target_repo, check=True)
+            (target_repo / "README.md").write_text("# demo\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=target_repo, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=target_repo, check=True, text=True, capture_output=True)
+            subprocess.run(["git", "remote", "add", "origin", str(target_repo)], cwd=target_repo, check=True)
+            plan_id = "plan-auto-build"
+            task_id = "task-auto-build"
+            plan_dir = tmp_path / "plans" / plan_id
+            task_dir = tmp_path / "tasks" / task_id
+            plan_dir.mkdir(parents=True)
+            task_dir.mkdir(parents=True)
+            (plan_dir / "meta.json").write_text(json.dumps({"plan_id": plan_id, "repo": str(target_repo), "base_branch": "main"}), encoding="utf-8")
+            (task_dir / "meta.json").write_text(json.dumps({
+                "task_id": task_id,
+                "source_plan_id": plan_id,
+                "state": "SHAPE",
+                "phase_status": {"SHAPE": "READY"},
+                "awaiting_operator": False,
+                "pr_packet": {"branch": "feat/auto-build", "title": "Auto build"},
+            }), encoding="utf-8")
+            (task_dir / "task.md").write_text("# Task\n\n- auto build\n", encoding="utf-8")
+            dispatch_pr_worker.dispatch_one(tmp_path, task_id=task_id, execute=True)
+            meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
+            meta["state"] = "READY_FOR_BUILDER"
+            meta["phase_status"] = {**meta.get("phase_status", {}), "EXECUTE": "READY_FOR_BUILDER"}
+            (task_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+            (tmp_path / ".automation").mkdir(exist_ok=True)
+            command = f"{sys.executable} -c \"from pathlib import Path; Path('AUTO_BUILD.md').write_text('auto built\\n', encoding='utf-8')\""
+            (tmp_path / ".automation" / "builder-config.json").write_text(json.dumps({"enabled": True, "builder_command": command}), encoding="utf-8")
+
+            result = auto_builder_runner.auto_run_builder(tmp_path, execute=True)
+
+            self.assertEqual(result["decision"], "BUILT")
+            meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["state"], "VERIFYING")
+            self.assertTrue((Path(meta["dispatch"]["worktree"]) / "AUTO_BUILD.md").exists())
 
     def test_publish_draft_pr_blocks_until_readiness_passes_for_current_sha(self):
         with tempfile.TemporaryDirectory() as td:
