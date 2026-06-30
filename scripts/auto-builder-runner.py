@@ -11,6 +11,7 @@ import argparse
 import importlib.util
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +85,41 @@ def mark_ready_for_builder(task_dir: Path, meta: dict[str, Any], reason: str) ->
     write_json(task_dir / "meta.json", meta)
 
 
+def _acquire_builder_lock(repo_root: Path):
+    """Single-builder mutex with stale-pid reclaim. A build held phase EXECUTE=DISPATCHED
+    for its whole (long) run, and active_build_tasks() skips DISPATCHED — so a later tick
+    saw 'no active build' and started a SECOND concurrent builder for the same task. This
+    lock makes builds strictly one-at-a-time across ticks; a dead owner (crash/reboot) is
+    reclaimed so it never wedges (the failure mode the autopilot lock hit after an outage)."""
+    lock_dir = repo_root / ".automation" / "locks" / "auto-builder-runner.lock"
+    lock_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lock_dir.mkdir()
+    except FileExistsError:
+        owner = read_json(lock_dir / "owner.json", {}) or {}
+        pid = owner.get("pid")
+        alive = isinstance(pid, int)
+        if alive:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                alive = False
+        if alive:
+            return None
+        shutil.rmtree(lock_dir, ignore_errors=True)
+        try:
+            lock_dir.mkdir()
+        except FileExistsError:
+            return None
+    write_json(lock_dir / "owner.json", {"kind": "AUTO-BUILDER-LOCK", "pid": os.getpid(), "acquired_at": utc_now()})
+    return lock_dir
+
+
+def _release_builder_lock(lock_dir) -> None:
+    if lock_dir is not None:
+        shutil.rmtree(lock_dir, ignore_errors=True)
+
+
 def auto_run_builder(repo_root: Path, *, execute: bool = False, timeout_seconds: int = 1800) -> dict[str, Any]:
     command = configured_builder_command(repo_root)
     selected = ready_task(repo_root)
@@ -101,8 +137,14 @@ def auto_run_builder(repo_root: Path, *, execute: bool = False, timeout_seconds:
         return {"kind": "AUTO-BUILDER", "decision": "BLOCKED", "task_id": task_id, "reason": reason}
     if not execute:
         return {"kind": "AUTO-BUILDER", "decision": "WOULD_RUN_BUILDER", "task_id": task_id, "builder_command_configured": True}
-    run_builder_worker = load_run_builder_worker()
-    return run_builder_worker.run_builder(repo_root, task_id=task_id, builder_command=command, timeout_seconds=timeout_seconds)
+    lock_dir = _acquire_builder_lock(repo_root)
+    if lock_dir is None:
+        return {"kind": "AUTO-BUILDER", "decision": "HOLD", "reason": "another builder run holds the single-builder lock", "task_id": task_id}
+    try:
+        run_builder_worker = load_run_builder_worker()
+        return run_builder_worker.run_builder(repo_root, task_id=task_id, builder_command=command, timeout_seconds=timeout_seconds)
+    finally:
+        _release_builder_lock(lock_dir)
 
 
 def main() -> None:

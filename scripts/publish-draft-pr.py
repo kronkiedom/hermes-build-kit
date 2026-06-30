@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Publish a readiness-passed task branch as a draft GitHub PR.
+"""Publish a readiness-passed task branch as a ready-for-review GitHub PR.
 
-This publisher is fail-closed: it refuses to push or create a draft PR unless the
+This publisher is fail-closed: it refuses to push or create a PR unless the
 recorded readiness job passes for the worktree's current HEAD SHA.
 """
 from __future__ import annotations
@@ -58,12 +58,17 @@ def current_branch(worktree: Path) -> str:
     return branch or "DETACHED"
 
 
+def branch_from_head_ref(head_ref: str) -> str:
+    """Return the branch component from a gh --head ref like owner:branch."""
+    return head_ref.rsplit(":", 1)[-1]
+
+
 def default_pr_body(task_id: str, meta: dict[str, Any], readiness_job_id: str) -> str:
     build = dict_or_empty(meta.get("build"))
     changed_files = "\n".join(f"- `{path}`" for path in build.get("changed_files", [])) or "- none recorded"
     return (
         f"## Summary\n"
-        f"Draft PR for build-control task `{task_id}`.\n\n"
+        f"Ready-for-review PR for build-control task `{task_id}`.\n\n"
         f"## Build evidence\n"
         f"- Commit: `{build.get('commit_sha')}`\n"
         f"- Readiness job: `{readiness_job_id}`\n"
@@ -101,7 +106,7 @@ def publish_draft_pr(
 ) -> dict[str, Any]:
     selected = load_task(repo_root, task_id)
     if not selected:
-        return {"kind": "DRAFT-PR-PUBLISH", "decision": "IDLE", "reason": "no built task with readiness evidence is eligible for publishing"}
+        return {"kind": "PR-PUBLISH", "decision": "IDLE", "reason": "no built task with readiness evidence is eligible for publishing"}
     task_dir, meta = selected
     selected_task_id = str(meta.get("task_id") or task_dir.name)
     dispatch = dict_or_empty(meta.get("dispatch"))
@@ -109,19 +114,19 @@ def publish_draft_pr(
     packet = dict_or_empty(meta.get("pr_packet"))
     worktree = Path(str(dispatch.get("worktree") or "")).expanduser()
     if not worktree.exists():
-        return {"kind": "DRAFT-PR-PUBLISH", "decision": "BLOCKED", "task_id": selected_task_id, "reason": "dispatch worktree does not exist", "worktree": str(worktree)}
+        return {"kind": "PR-PUBLISH", "decision": "BLOCKED", "task_id": selected_task_id, "reason": "dispatch worktree does not exist", "worktree": str(worktree)}
 
     readiness_job_id = str(build.get("readiness_job_id") or "")
     try:
         readiness_job = load_readiness_job(repo_root, readiness_job_id)
     except FileNotFoundError as exc:
-        return {"kind": "DRAFT-PR-PUBLISH", "decision": "BLOCKED", "task_id": selected_task_id, "reason": "missing readiness job", "error": str(exc)}
+        return {"kind": "PR-PUBLISH", "decision": "BLOCKED", "task_id": selected_task_id, "reason": "missing readiness job", "error": str(exc)}
 
     sha = current_sha(worktree)
     readiness = readiness_blocks(readiness_job, current_sha=sha, explain=True)
     if not isinstance(readiness, dict):
         return {
-            "kind": "DRAFT-PR-PUBLISH",
+            "kind": "PR-PUBLISH",
             "decision": "BLOCKED",
             "task_id": selected_task_id,
             "reason": "readiness gate returned an invalid explanation",
@@ -129,10 +134,10 @@ def publish_draft_pr(
         }
     if readiness["blocked"]:
         return {
-            "kind": "DRAFT-PR-PUBLISH",
+            "kind": "PR-PUBLISH",
             "decision": "BLOCKED",
             "task_id": selected_task_id,
-            "reason": "readiness gate blocks draft PR publishing",
+            "reason": "readiness gate blocks PR publishing",
             "readiness": readiness,
             "readiness_job_id": readiness_job_id,
         }
@@ -140,14 +145,26 @@ def publish_draft_pr(
     branch = str(dispatch.get("branch") or current_branch(worktree))
     base_branch = str(dispatch.get("base_branch") or "main")
     head_ref = head or branch
-    pr_title = title or f"draft: {packet.get('title') or selected_task_id}"
+    # Root cause: publish config is global, while build-control may have several
+    # PR-ready tasks; a stale head ref must not publish the wrong task branch.
+    if branch_from_head_ref(str(head_ref)) != branch:
+        return {
+            "kind": "PR-PUBLISH",
+            "decision": "BLOCKED",
+            "task_id": selected_task_id,
+            "reason": "configured head ref does not match the selected task branch",
+            "branch": branch,
+            "head": head_ref,
+            "required_head_branch": branch,
+        }
+    pr_title = title or str(packet.get('title') or selected_task_id)
     body = default_pr_body(selected_task_id, meta, readiness_job_id)
-    body_path = task_dir / "draft-pr-body.md"
+    body_path = task_dir / "pr-body.md"
     write_text(body_path, body)
 
     if not execute:
         return {
-            "kind": "DRAFT-PR-PUBLISH",
+            "kind": "PR-PUBLISH",
             "decision": "WOULD_PUBLISH",
             "task_id": selected_task_id,
             "branch": branch,
@@ -160,17 +177,19 @@ def publish_draft_pr(
         }
 
     push = run(["git", "push", "-u", push_remote, branch], cwd=worktree, check=True)
-    gh_cmd = ["gh", "pr", "create", "--draft", "--base", base_branch, "--head", head_ref, "--title", pr_title, "--body-file", str(body_path)]
+    # Root cause: PR-status handoff expects readiness-passed branches to be reviewable.
+    # Creating GitHub drafts hid clean 5x5-passed PRs behind a second manual state flip.
+    gh_cmd = ["gh", "pr", "create", "--base", base_branch, "--head", head_ref, "--title", pr_title, "--body-file", str(body_path)]
     if repo:
         gh_cmd.extend(["--repo", repo])
     created = run(gh_cmd, cwd=worktree, check=True)
     pr_url = str(created["stdout"]).strip().splitlines()[-1] if str(created["stdout"]).strip() else ""
     updated = update_task_state(task_dir, meta, {
-        "state": "PR_DRAFT",
-        "state_reason": "draft PR published after readiness gate passed",
-        "github": {**dict_or_empty(meta.get("github")), "draft_pr_url": pr_url, "published_at": utc_now()},
+        "state": "PR_OPEN",
+        "state_reason": "ready-for-review PR published after readiness gate passed",
+        "github": {**dict_or_empty(meta.get("github")), "pr_url": pr_url, "published_at": utc_now()},
     })
-    event = {"kind": "DRAFT-PR-PUBLISH", "decision": "PUBLISHED", "task_id": selected_task_id, "branch": branch, "head": head_ref, "push_remote": push_remote, "pr_url": pr_url, "timestamp": utc_now()}
+    event = {"kind": "PR-PUBLISH", "decision": "PUBLISHED", "task_id": selected_task_id, "branch": branch, "head": head_ref, "push_remote": push_remote, "pr_url": pr_url, "timestamp": utc_now()}
     append_publish_ledger(repo_root, event)
     return {**event, "meta": {"state": updated.get("state"), "state_reason": updated.get("state_reason")}, "push": push}
 
@@ -178,7 +197,7 @@ def publish_draft_pr(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task-id", default=None)
-    parser.add_argument("--execute", action="store_true", help="Push and create the draft PR. Without this, dry-run only.")
+    parser.add_argument("--execute", action="store_true", help="Push and create the ready-for-review PR. Without this, dry-run only.")
     parser.add_argument("--repo", default=None, help="Optional owner/repo for gh pr create.")
     parser.add_argument("--title", default=None)
     parser.add_argument("--push-remote", default="origin", help="Git remote to push the branch to. Use a fork remote when upstream origin is read-only.")

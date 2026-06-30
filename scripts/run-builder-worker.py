@@ -15,7 +15,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from plan_automation_lib import read_json, utc_now, write_json, write_text
+from plan_automation_lib import read_json, utc_now, write_json, write_task_readiness_artifacts, write_text
 from pr_readiness_lib import create_readiness_job
 
 BUILDABLE_STATES = {"EXECUTE", "DISPATCHED", "READY_FOR_BUILDER"}
@@ -107,6 +107,30 @@ def update_task_state(task_dir: Path, meta: dict[str, Any], updates: dict[str, A
     return updated
 
 
+def without_build_blocker(meta: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in meta.items() if key != "build_blocker"}
+
+
+def validate_builder_model_metadata(task_dir: Path) -> tuple[bool, dict[str, Any] | str]:
+    metadata_path = task_dir / "builder-run-metadata.json"
+    if not metadata_path.exists():
+        return False, f"missing builder model provenance: {metadata_path}"
+    try:
+        metadata = read_json(metadata_path, {})
+    except Exception as exc:
+        return False, f"invalid builder model provenance: {exc}"
+    if not isinstance(metadata, dict):
+        return False, f"invalid builder model provenance payload: {metadata_path}"
+    provider = str(metadata.get("provider") or "")
+    model = str(metadata.get("model") or "")
+    tier = str(metadata.get("required_model_tier") or "")
+    role = str(metadata.get("workflow_role") or "")
+    allowed = {("openai", "gpt-5.4"), ("openai-api", "gpt-5.4"), ("anthropic", "claude-sonnet-4")}
+    if tier != "coding_working" or role != "builder" or (provider, model) not in allowed:
+        return False, f"builder model provenance mismatch: tier={tier or 'missing'} role={role or 'missing'} provider={provider or 'missing'} model={model or 'missing'}"
+    return True, metadata
+
+
 def run_builder(
     repo_root: Path,
     *,
@@ -179,6 +203,19 @@ def run_builder(
         append_build_ledger(repo_root, {**payload, "timestamp": utc_now()})
         return payload
 
+    model_ok, model_metadata = validate_builder_model_metadata(task_dir)
+    if not model_ok:
+        payload = {
+            "kind": "BUILDER-WORKER",
+            "decision": "BLOCKED",
+            "task_id": selected_task_id,
+            "reason": str(model_metadata),
+        }
+        write_text(task_dir / "builder-summary.md", f"# Builder blocked\n\n- Task: `{selected_task_id}`\n- Reason: {model_metadata}\n")
+        update_task_state(task_dir, meta, {"state": "ESCALATED", "awaiting_operator": True, "state_reason": payload["reason"], "build_blocker": payload})
+        append_build_ledger(repo_root, {**payload, "timestamp": utc_now()})
+        return payload
+
     changed_files = git_changed_files(worktree)
     if not changed_files:
         previous_build = dict_or_empty(meta.get("build"))
@@ -218,16 +255,30 @@ def run_builder(
                 "readiness_job_id": readiness["job_id"],
                 "timestamp": utc_now(),
                 "note": "evidence refreshed after no-change builder retry",
+                "model_policy": model_metadata,
             })
             write_text(summary_path, f"# Builder summary\n\n- Task: `{selected_task_id}`\n- Worktree: `{worktree}`\n- Commit: `{before_sha}`\n- Changed files: `{len(build['changed_files'])}`\n- Readiness job: `{readiness['job_id']}`\n- Note: builder command produced no new git changes; evidence was refreshed for the existing built SHA.\n\n## Diff stat\n\n```text\n{diff_stat.get('stdout') or ''}```\n")
             build["evidence_path"] = str(evidence_path)
             build["summary_path"] = str(summary_path)
+            state_reason = "builder produced no new code changes; readiness requeued for existing built SHA"
             write_text(task_dir / "builder-noop.md", f"# Builder no-op\n\n- Task: `{selected_task_id}`\n- Reason: builder command produced no git changes; readiness requeued for existing built SHA.\n- Commit: `{before_sha}`\n- Readiness job: `{readiness['job_id']}`\n")
-            update_task_state(task_dir, meta, {
+            write_task_readiness_artifacts(
+                task_dir,
+                task_id=selected_task_id,
+                worktree=worktree,
+                commit_sha=before_sha,
+                readiness_job_id=readiness["job_id"],
+                changed_files=build["changed_files"],
+                state_reason=state_reason,
+                note="builder command produced no new git changes; evidence was refreshed for the existing built SHA",
+            )
+            update_task_state(task_dir, without_build_blocker(meta), {
                 "state": "VERIFYING",
                 "phase_status": {**dict_or_empty(meta.get("phase_status")), "EXECUTE": "BUILT", "VERIFY": "QUEUED"},
                 "awaiting_operator": False,
-                "state_reason": "builder produced no new code changes; readiness requeued for existing built SHA",
+                "state_reason": state_reason,
+                "commit": before_sha,
+                "dispatch": {**dispatch, "readiness_job_id": readiness["job_id"]},
                 "build": build,
             })
             append_build_ledger(repo_root, {**payload, "timestamp": utc_now()})
@@ -259,17 +310,31 @@ def run_builder(
         "command_output_path": str(task_dir / "builder-command-output.json"),
         "readiness_job_id": readiness["job_id"],
         "timestamp": utc_now(),
+        "model_policy": model_metadata,
     }
     write_json(task_dir / "build-evidence.json", evidence)
     write_text(
         task_dir / "builder-summary.md",
         f"# Builder summary\n\n- Task: `{selected_task_id}`\n- Worktree: `{worktree}`\n- Commit: `{after_sha}`\n- Changed files: `{len(changed_files)}`\n- Readiness job: `{readiness['job_id']}`\n\n## Diff stat\n\n```text\n{diff_stat['stdout']}```\n",
     )
-    updated = update_task_state(task_dir, meta, {
+    state_reason = "builder command produced a commit; readiness audit queued"
+    write_task_readiness_artifacts(
+        task_dir,
+        task_id=selected_task_id,
+        worktree=worktree,
+        commit_sha=after_sha,
+        readiness_job_id=readiness["job_id"],
+        changed_files=changed_files,
+        state_reason=state_reason,
+        note="builder command produced a commit and queued SHA-scoped readiness",
+    )
+    updated = update_task_state(task_dir, without_build_blocker(meta), {
         "state": "VERIFYING",
         "phase_status": {**(meta.get("phase_status") or {}), "EXECUTE": "BUILT", "VERIFY": "QUEUED"},
         "awaiting_operator": False,
-        "state_reason": "builder command produced a commit; readiness audit queued",
+        "state_reason": state_reason,
+        "commit": after_sha,
+        "dispatch": {**dispatch, "readiness_job_id": readiness["job_id"]},
         "build": {
             "builder_command": command,
             "commit_sha": after_sha,
@@ -277,6 +342,7 @@ def run_builder(
             "readiness_job_id": readiness["job_id"],
             "summary_path": str(task_dir / "builder-summary.md"),
             "evidence_path": str(task_dir / "build-evidence.json"),
+            "model_policy": model_metadata,
         },
     })
     event = {"kind": "BUILDER-WORKER", "decision": "BUILT", "task_id": selected_task_id, "commit_sha": after_sha, "readiness_job_id": readiness["job_id"], "timestamp": utc_now()}

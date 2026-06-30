@@ -4,13 +4,14 @@
 Target workflow:
 Plan thread opens -> operator approves once -> build-control keeps moving until
 it needs a concrete decision -> operator answers decision -> build resumes ->
-readiness-gated draft PR opens when publish config allows -> PR-status owns review.
+readiness-gated PR opens when publish config allows -> PR-status owns review.
 """
 from __future__ import annotations
 
 import argparse
 import importlib.util
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -60,10 +61,26 @@ def acquire_autopilot_lock(repo_root: Path) -> tuple[bool, Path]:
     lock_dir.parent.mkdir(parents=True, exist_ok=True)
     try:
         lock_dir.mkdir()
-        write_json(lock_dir / "owner.json", {"kind": "BUILD-CONTROL-AUTOPILOT-LOCK", "acquired_at": utc_now()})
-        return True, lock_dir
     except FileExistsError:
-        return False, lock_dir
+        # Stale-lock reclaim: a crash/reboot used to leave this dir forever, wedging
+        # ALL dispatch (the post-outage failure). If the owner pid is dead, reclaim it.
+        owner = read_json(lock_dir / "owner.json", {}) or {}
+        pid = owner.get("pid")
+        alive = isinstance(pid, int)
+        if alive:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                alive = False
+        if alive:
+            return False, lock_dir
+        shutil.rmtree(lock_dir, ignore_errors=True)
+        try:
+            lock_dir.mkdir()
+        except FileExistsError:
+            return False, lock_dir
+    write_json(lock_dir / "owner.json", {"kind": "BUILD-CONTROL-AUTOPILOT-LOCK", "pid": os.getpid(), "acquired_at": utc_now()})
+    return True, lock_dir
 
 
 def release_autopilot_lock(lock_dir: Path) -> None:

@@ -5,7 +5,7 @@ category: automation
 tags:
   - automation
   - reliability
-status: discovered
+status: implemented
 eligibility_class: docs-only
 source_paths:
   - /home/armoruser/hermes-build-kit/docs/automation-architecture.md
@@ -20,4 +20,5 @@ worker, but no starter implementation exists in scripts/. This is grounded, opti
 - scripts/ contains no stall-detector starter
 
 ## Queue intent
-- discovery only; prep-eligible after operator review
+- approved by operator on 2026-06-25 and implemented as `scripts/stall-detector.py`
+- status output: `.automation/status/stall-detector-last.json`

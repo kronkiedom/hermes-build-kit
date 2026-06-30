@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Autocure pre-PR build-control task branches that are behind their base.
 
-This worker runs before draft PR publishing. It rebases a clean, built task
+This worker runs before PR publishing. It rebases a clean, built task
 worktree onto its configured base branch and queues a fresh SHA-scoped readiness
 job. It never pushes. Conflicts or dirty worktrees fail closed and require an
 operator/manual fix.
@@ -14,11 +14,11 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from plan_automation_lib import read_json, utc_now, write_json, write_text
+from plan_automation_lib import read_json, utc_now, write_json, write_task_readiness_artifacts, write_text
 from pr_readiness_lib import create_readiness_job
 
 ELIGIBLE_STATES = {"VERIFYING", "PR_READY"}
-TERMINAL_STATES = {"DONE", "CANCELLED", "SUPERSEDED", "PR_DRAFT"}
+TERMINAL_STATES = {"DONE", "CANCELLED", "SUPERSEDED", "PR_DRAFT", "PR_OPEN"}
 
 
 def run(cmd: list[str], *, cwd: Path, check: bool = False) -> dict[str, Any]:
@@ -70,6 +70,10 @@ def update_task(task_dir: Path, meta: dict[str, Any], updates: dict[str, Any]) -
     updated = {**meta, **updates, "updated_at": utc_now()}
     write_json(task_dir / "meta.json", updated)
     return updated
+
+
+def without_build_blocker(meta: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in meta.items() if key != "build_blocker"}
 
 
 def autocure_pre_pr_rebase(repo_root: Path, *, execute: bool = False, task_id: str | None = None) -> dict[str, Any]:
@@ -188,10 +192,23 @@ def autocure_pre_pr_rebase(repo_root: Path, *, execute: bool = False, task_id: s
     write_text(summary_path, f"# Builder summary\n\n- Task: `{selected_task_id}`\n- Worktree: `{worktree}`\n- Commit: `{after_sha}`\n- Changed files: `{len(changed_files_after)}`\n- Readiness job: `{new_job['job_id']}`\n- Rebased from: `{before_sha}`\n\n## Diff stat\n\n```text\n{diff_stat['stdout']}```\n")
     build["evidence_path"] = str(evidence_path)
     build["summary_path"] = str(summary_path)
-    update_task(task_dir, meta, {
+    state_reason = "pre-PR branch rebased onto current base; readiness audit queued for rebased SHA"
+    write_task_readiness_artifacts(
+        task_dir,
+        task_id=selected_task_id,
+        worktree=worktree,
+        commit_sha=after_sha,
+        readiness_job_id=new_job["job_id"],
+        changed_files=changed_files_after,
+        state_reason=state_reason,
+        note="pre-PR rebase autocure refreshed evidence after rebasing the built branch",
+    )
+    update_task(task_dir, without_build_blocker(meta), {
         "state": "VERIFYING",
         "awaiting_operator": False,
-        "state_reason": "pre-PR branch rebased onto current base; readiness audit queued for rebased SHA",
+        "state_reason": state_reason,
+        "commit": after_sha,
+        "dispatch": {**dispatch, "readiness_job_id": new_job["job_id"]},
         "build": build,
     })
     event = {

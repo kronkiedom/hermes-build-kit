@@ -29,7 +29,7 @@ def main():
     if tasks_root.exists():
         for meta_path in sorted(tasks_root.glob("*/meta.json")):
             meta = load_json(meta_path, {})
-            if meta.get("state") in ACTIVE_STATES:
+            if meta.get("state") in ACTIVE_STATES and not meta.get("dispatch", {}).get("pr_created", False):
                 active.append({
                     "task_id": meta.get("task_id", meta_path.parent.name),
                     "state": meta.get("state"),

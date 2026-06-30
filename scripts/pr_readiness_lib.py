@@ -15,6 +15,13 @@ from plan_automation_lib import read_json, utc_now, write_json
 
 BLOCKED_ACTIONS = ["ready_for_review", "merge_ready", "pr_ready_claim", "ready_for_rereview"]
 ALLOWED_ACTIONS = ["continue_building", "draft_pr", "other_packets", "fix_issues"]
+REQUIRED_READINESS_MODEL_TIER = "planning_thinking"
+REQUIRED_READINESS_WORKFLOW_ROLE = "readiness_auditor"
+ALLOWED_READINESS_MODELS = {
+    ("openai", "gpt-5.5"),
+    ("openai-api", "gpt-5.5"),
+    ("anthropic", "claude-opus-4-8"),
+}
 REQUIRED_CLEANUP_CRITICS = {"grounding", "security", "regression", "edge_case_matrix", "fresh_review_delta"}
 SSRF_REQUIRED_CASES = {"ipv6_loopback", "ipv4_mapped_metadata", "private_ipv4"}
 RACE_REQUIRED_CASES = {"stale_actor_window", "prior_state_guard", "identity_pin", "reset_stale_binding"}
@@ -48,6 +55,8 @@ def create_readiness_job(
         "sha": sha,
         "pr_url": pr_url,
         "audit_contract": audit_contract,
+        "required_model_tier": REQUIRED_READINESS_MODEL_TIER,
+        "required_workflow_role": REQUIRED_READINESS_WORKFLOW_ROLE,
         "state": "READINESS_QUEUED",
         "passed": False,
         "issues": [],
@@ -129,6 +138,47 @@ def validate_review_cleanup_evidence(evidence: dict[str, Any] | None) -> list[di
     return issues
 
 
+def validate_model_policy_evidence(evidence: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Return fail-closed issues when readiness lacks planning-tier provenance.
+
+    Root cause: a readiness verifier can be overridden by env/config, so the PR
+    gate must validate model provenance at the sink instead of trusting the
+    wrapper prompt alone.
+    """
+    if not evidence:
+        return [{"kind": "missing_model_policy", "severity": "P0", "message": "readiness evidence is INVALID-WITHOUT model_policy provenance"}]
+    policy = evidence.get("model_policy") if isinstance(evidence, dict) else None
+    if not isinstance(policy, dict):
+        return [{"kind": "missing_model_policy", "severity": "P0", "message": "readiness evidence is INVALID-WITHOUT model_policy provenance"}]
+    issues: list[dict[str, Any]] = []
+    tier = str(policy.get("required_model_tier") or "")
+    role = str(policy.get("workflow_role") or "")
+    provider = str(policy.get("provider") or "")
+    model = str(policy.get("model") or "")
+    if tier != REQUIRED_READINESS_MODEL_TIER:
+        issues.append({
+            "kind": "wrong_readiness_model_tier",
+            "severity": "P0",
+            "message": f"readiness requires {REQUIRED_READINESS_MODEL_TIER} model tier",
+            "evidence": f"required_model_tier={tier or 'missing'}",
+        })
+    if role != REQUIRED_READINESS_WORKFLOW_ROLE:
+        issues.append({
+            "kind": "wrong_readiness_workflow_role",
+            "severity": "P0",
+            "message": f"readiness requires {REQUIRED_READINESS_WORKFLOW_ROLE} workflow role",
+            "evidence": f"workflow_role={role or 'missing'}",
+        })
+    if (provider, model) not in ALLOWED_READINESS_MODELS:
+        issues.append({
+            "kind": "wrong_readiness_model",
+            "severity": "P0",
+            "message": "readiness audit must run on an approved planning_thinking model",
+            "evidence": f"provider={provider or 'missing'} model={model or 'missing'}",
+        })
+    return issues
+
+
 def mark_readiness_result(
     repo_root: Path,
     job_id: str,
@@ -138,7 +188,7 @@ def mark_readiness_result(
     evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     job = load_readiness_job(repo_root, job_id)
-    evidence_issues = validate_review_cleanup_evidence(evidence)
+    evidence_issues = [*validate_review_cleanup_evidence(evidence), *validate_model_policy_evidence(evidence)]
     all_issues = [*issues, *evidence_issues]
     job["passed"] = bool(passed) and not all_issues
     job["issues"] = all_issues
@@ -167,5 +217,9 @@ def readiness_blocks(job: dict[str, Any], *, current_sha: str, explain: bool = F
     elif not job.get("passed") or job.get("state") != "PR_READY":
         result = {"blocked": True, "reason": "audit_not_passed", "state": job.get("state")}
     else:
-        result = {"blocked": False, "reason": "passed", "state": job.get("state")}
+        model_issues = validate_model_policy_evidence(job.get("evidence") if isinstance(job.get("evidence"), dict) else None)
+        if model_issues:
+            result = {"blocked": True, "reason": "model_policy_invalid", "state": job.get("state"), "issues": model_issues}
+        else:
+            result = {"blocked": False, "reason": "passed", "state": job.get("state")}
     return result if explain else bool(result["blocked"])

@@ -17,6 +17,16 @@ from plan_status_lib import sync_open_plan_threads
 import importlib.util
 
 
+def readiness_model_policy() -> dict[str, str]:
+    return {
+        "policy_version": "2026-06-27",
+        "workflow_role": "readiness_auditor",
+        "required_model_tier": "planning_thinking",
+        "provider": "openai-api",
+        "model": "gpt-5.5",
+    }
+
+
 def load_script_module(name: str, file_name: str):
     spec = importlib.util.spec_from_file_location(name, REPO_ROOT / "scripts" / file_name)
     assert spec and spec.loader
@@ -417,6 +427,35 @@ class PlanAutomationTests(unittest.TestCase):
         self.assertEqual(status["issues"][0]["kind"], "awaiting_re_review")
         self.assertIn("awaiting re-review", format_status_message(status))
 
+
+    def test_pr_status_marks_reviewer_hold_as_non_ping_waiting(self):
+        pr = {
+            "owner": "dom-armor",
+            "repo": "armor-swarm",
+            "number": 45,
+            "title": "docs: architecture proposal",
+            "html_url": "https://github.com/dom-armor/armor-swarm/pull/45",
+            "author": "dom-armor",
+            "draft": False,
+            "mergeable_state": "behind",
+            "head_sha": "held-sha",
+            "reviews": [],
+            "check_runs": [],
+            "issue_comments": [
+                {"user": "Drake-Armor", "body": "**Review-gated — holding, not merging.** This is a forward-looking architecture proposal.", "created_at": "2026-06-27T04:24:03Z", "html_url": "https://github.com/x#hold"},
+            ],
+            "review_comments": [],
+        }
+
+        status = classify_pr(pr, operator_login="dom-armor")
+
+        self.assertEqual(status["state"], "WAITING")
+        kinds = {issue["kind"] for issue in status["issues"]}
+        self.assertIn("intentional_hold", kinds)
+        self.assertIn("held_rebase_deferred", kinds)
+        self.assertNotIn("rebase_required", kinds)
+        self.assertIn("waiting", format_status_message(status))
+
     def test_pr_status_marks_stacked_child_waiting_on_blocked_parent(self):
         parent = {
             "id": "dom-armor/armor-swarm#1",
@@ -476,6 +515,81 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertEqual(active["state"], "FIX_PUSHED_WAITING_CI_OR_REVIEW")
             self.assertEqual(active["resolution_sha"], "sha-2")
 
+
+    def test_pr_status_does_not_alert_for_intentional_hold_waiting_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            sent = []
+            edited = []
+            old_post, old_edit, old_thread = pr_status_lib.post_message, pr_status_lib.edit_message, pr_status_lib.ensure_thread
+            try:
+                pr_status_lib.post_message = lambda token, channel_id, content: sent.append((channel_id, content)) or f"msg-{len(sent)}"
+                pr_status_lib.edit_message = lambda token, channel_id, message_id, content: edited.append((channel_id, message_id, content))
+                pr_status_lib.ensure_thread = lambda token, channel_id, message_id, name: "thread-held"
+                status = {
+                    "id": "dom-armor/armor-swarm#45",
+                    "state": "WAITING",
+                    "url": "https://github.com/dom-armor/armor-swarm/pull/45",
+                    "title": "docs: held proposal",
+                    "head_ref": "docs/held",
+                    "base_ref": "main",
+                    "head_sha": "sha-held",
+                    "issues": [
+                        {"kind": "intentional_hold", "summary": "reviewer placed an intentional hold", "url": "https://github.com/x#hold"},
+                        {"kind": "held_rebase_deferred", "summary": "branch is behind but hold is active"},
+                    ],
+                }
+                result = sync_discord_status_channel(tmp_path, [status], channel_id="chan", operator_user_id="op", token="tok")
+            finally:
+                pr_status_lib.post_message, pr_status_lib.edit_message, pr_status_lib.ensure_thread = old_post, old_edit, old_thread
+
+            actions = {a["action"] for a in result["actions"]}
+            self.assertIn("suppressed_non_ping_waiting", actions)
+            self.assertNotIn("alerted_thread", actions)
+            self.assertEqual(len(sent), 1)  # status message only; no pinging alert thread
+
+
+    def test_pr_status_suppression_survives_discord_status_edit_failure(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            ledger_path = tmp_path / ".automation" / "pr-status-ledger.json"
+            ledger_path.parent.mkdir(parents=True)
+            ledger_path.write_text(json.dumps({
+                "prs": {
+                    "dom-armor/armor-swarm#45": {
+                        "message_id": "msg-old",
+                        "thread_id": "thread-held",
+                        "last_state": "OK",
+                    }
+                }
+            }), encoding="utf-8")
+            sent = []
+            old_post, old_edit = pr_status_lib.post_message, pr_status_lib.edit_message
+            try:
+                pr_status_lib.post_message = lambda token, channel_id, content: sent.append((channel_id, content)) or f"msg-{len(sent)}"
+                pr_status_lib.edit_message = lambda token, channel_id, message_id, content: (_ for _ in ()).throw(RuntimeError("Discord edit rate limited"))
+                status = {
+                    "id": "dom-armor/armor-swarm#45",
+                    "state": "WAITING",
+                    "url": "https://github.com/dom-armor/armor-swarm/pull/45",
+                    "title": "docs: held proposal",
+                    "head_ref": "docs/held",
+                    "base_ref": "main",
+                    "head_sha": "sha-held",
+                    "issues": [{"kind": "intentional_hold", "summary": "reviewer placed an intentional hold"}],
+                }
+                result = sync_discord_status_channel(tmp_path, [status], channel_id="chan", operator_user_id="op", token="tok")
+            finally:
+                pr_status_lib.post_message, pr_status_lib.edit_message = old_post, old_edit
+
+            actions = {a["action"] for a in result["actions"]}
+            self.assertIn("update_message_failed", actions)
+            self.assertIn("suppressed_non_ping_waiting", actions)
+            self.assertNotIn("alerted_thread", actions)
+            self.assertEqual(sent, [])
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+            self.assertEqual(ledger["prs"]["dom-armor/armor-swarm#45"]["last_state"], "WAITING")
+
     def test_pr_status_archives_thread_after_pr_merge(self):
         with tempfile.TemporaryDirectory() as td:
             tmp_path = Path(td)
@@ -520,6 +634,49 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertEqual(entry["last_state"], "MERGED")
             self.assertEqual(entry["active_alert"]["state"], "RESOLVED")
             self.assertEqual(entry["active_alert"]["resolved_by"], "merged")
+            self.assertIn("thread_archived_at", entry)
+
+
+    def test_pr_status_archives_merged_thread_even_when_status_edit_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            ledger_path = tmp_path / ".automation" / "pr-status-ledger.json"
+            ledger_path.parent.mkdir(parents=True)
+            ledger_path.write_text(json.dumps({
+                "prs": {
+                    "dom-armor/armor-swarm#11": {
+                        "message_id": "msg-11",
+                        "thread_id": "thread-11",
+                        "last_state": "OK",
+                        "active_alert": {"state": "RESOLVED"},
+                    }
+                }
+            }), encoding="utf-8")
+            archived = []
+            old_fetch, old_edit, old_archive = pr_status_lib.fetch_pr_merge_state, pr_status_lib.edit_message, pr_status_lib.archive_thread
+            try:
+                pr_status_lib.fetch_pr_merge_state = lambda pr_key: {
+                    "merged": True,
+                    "merged_at": "2026-06-25T14:30:00Z",
+                    "url": "https://github.com/dom-armor/armor-swarm/pull/11",
+                    "title": "fix: merged",
+                    "head_ref": "fix/merged",
+                    "base_ref": "main",
+                    "head_sha": "sha-merged",
+                }
+                pr_status_lib.edit_message = lambda token, channel_id, message_id, content: (_ for _ in ()).throw(RuntimeError("Discord old-message edit limit"))
+                pr_status_lib.archive_thread = lambda token, thread_id: archived.append(thread_id)
+                result = sync_discord_status_channel(tmp_path, [], channel_id="chan", operator_user_id="op", token="tok")
+            finally:
+                pr_status_lib.fetch_pr_merge_state, pr_status_lib.edit_message, pr_status_lib.archive_thread = old_fetch, old_edit, old_archive
+
+            actions = {a["action"] for a in result["actions"]}
+            self.assertIn("update_message_merged_failed", actions)
+            self.assertIn("archived_thread_after_merge", actions)
+            self.assertEqual(archived, ["thread-11"])
+            ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+            entry = ledger["prs"]["dom-armor/armor-swarm#11"]
+            self.assertEqual(entry["last_state"], "MERGED")
             self.assertIn("thread_archived_at", entry)
 
     def test_dispatch_worker_blocks_unresolved_operator_defined_repo(self):
@@ -624,7 +781,8 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertEqual(dispatched["decision"], "DISPATCHED")
 
             command = (
-                f"{sys.executable} -c \"from pathlib import Path; "
+                f"{sys.executable} -c \"import json, os; from pathlib import Path; "
+                "Path(os.environ['BUILD_TASK_DIR'], 'builder-run-metadata.json').write_text(json.dumps({'policy_version': '2026-06-27', 'workflow_role': 'builder', 'required_model_tier': 'coding_working', 'provider': 'openai-api', 'model': 'gpt-5.4'}), encoding='utf-8'); "
                 "Path('BUILD_OUTPUT.md').write_text('builder wrote this\\n', encoding='utf-8')\""
             )
             result = run_builder_worker.run_builder(tmp_path, task_id=task_id, builder_command=command)
@@ -673,12 +831,18 @@ class PlanAutomationTests(unittest.TestCase):
             (task_dir / "meta.json").write_text(json.dumps({
                 "task_id": task_id,
                 "state": "READY_FOR_BUILDER",
+                "commit": "stale-top-level-sha",
+                "build_blocker": {"decision": "BLOCKED", "reason": "stale no-change blocker"},
                 "awaiting_operator": False,
                 "phase_status": {"EXECUTE": "READY_FOR_BUILDER", "VERIFY": "FAILED"},
-                "dispatch": {"worktree": str(worktree), "branch": "feat/noop-built", "base_branch": "main"},
+                "dispatch": {"worktree": str(worktree), "branch": "feat/noop-built", "base_branch": "main", "readiness_job_id": "stale-job"},
                 "build": {"commit_sha": sha, "readiness_job_id": job["job_id"]},
             }), encoding="utf-8")
-            command = f"{sys.executable} -c \"print('nothing to change')\""
+            command = (
+                f"{sys.executable} -c \"import json, os; from pathlib import Path; "
+                "Path(os.environ['BUILD_TASK_DIR'], 'builder-run-metadata.json').write_text(json.dumps({'policy_version': '2026-06-27', 'workflow_role': 'builder', 'required_model_tier': 'coding_working', 'provider': 'openai-api', 'model': 'gpt-5.4'}), encoding='utf-8'); "
+                "print('nothing to change')\""
+            )
 
             result = run_builder_worker.run_builder(tmp_path, task_id=task_id, builder_command=command)
 
@@ -687,6 +851,9 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertEqual(meta["state"], "VERIFYING")
             self.assertFalse(meta["awaiting_operator"])
             self.assertEqual(meta["phase_status"]["VERIFY"], "QUEUED")
+            self.assertNotIn("build_blocker", meta)
+            self.assertEqual(meta["commit"], sha)
+            self.assertEqual(meta["dispatch"]["readiness_job_id"], job["job_id"])
             self.assertEqual(meta["build"]["commit_sha"], sha)
             self.assertEqual(meta["build"]["readiness_job_id"], job["job_id"])
             requeued_job = json.loads((tmp_path / ".automation" / "pr-readiness" / f"{meta['build']['readiness_job_id']}.json").read_text(encoding="utf-8"))
@@ -697,6 +864,12 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertIn("evidence refreshed after no-change builder retry", evidence["note"])
             summary = (task_dir / "builder-summary.md").read_text(encoding="utf-8")
             self.assertIn(sha, summary)
+            task_summary = (task_dir / "summary.md").read_text(encoding="utf-8")
+            task_evidence = (task_dir / "evidence.md").read_text(encoding="utf-8")
+            self.assertIn(sha, task_summary)
+            self.assertIn(job["job_id"], task_summary)
+            self.assertIn(sha, task_evidence)
+            self.assertIn(job["job_id"], task_evidence)
 
     def test_auto_builder_blocks_ready_task_without_configured_command(self):
         with tempfile.TemporaryDirectory() as td:
@@ -721,6 +894,37 @@ class PlanAutomationTests(unittest.TestCase):
             meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["state"], "READY_FOR_BUILDER")
             self.assertIn("builder command is not configured", meta["state_reason"])
+
+    def test_run_builder_worker_blocks_without_model_metadata(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            target_repo = tmp_path / "target-repo"
+            target_repo.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=target_repo, check=True, text=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=target_repo, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=target_repo, check=True)
+            (target_repo / "README.md").write_text("# demo\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=target_repo, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=target_repo, check=True, text=True, capture_output=True)
+            subprocess.run(["git", "remote", "add", "origin", str(target_repo)], cwd=target_repo, check=True)
+            task_id = "task-missing-builder-model"
+            task_dir = tmp_path / "tasks" / task_id
+            task_dir.mkdir(parents=True)
+            worktree = tmp_path / "worktree"
+            subprocess.run(["git", "clone", str(target_repo), str(worktree)], check=True, text=True, capture_output=True)
+            (task_dir / "builder-prompt.md").write_text("# build\n", encoding="utf-8")
+            (task_dir / "meta.json").write_text(json.dumps({
+                "task_id": task_id,
+                "state": "READY_FOR_BUILDER",
+                "awaiting_operator": False,
+                "dispatch": {"worktree": str(worktree), "branch": "main"},
+            }), encoding="utf-8")
+            command = f"{sys.executable} -c \"from pathlib import Path; Path('UNVERIFIED.md').write_text('changed\\n', encoding='utf-8')\""
+
+            result = run_builder_worker.run_builder(tmp_path, task_id=task_id, builder_command=command)
+
+            self.assertEqual(result["decision"], "BLOCKED")
+            self.assertIn("missing builder model provenance", result["reason"])
 
     def test_auto_builder_uses_run_builder_worker_eligibility(self):
         with tempfile.TemporaryDirectory() as td:
@@ -826,7 +1030,11 @@ class PlanAutomationTests(unittest.TestCase):
             meta["phase_status"] = {**meta.get("phase_status", {}), "EXECUTE": "READY_FOR_BUILDER"}
             (task_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
             (tmp_path / ".automation").mkdir(exist_ok=True)
-            command = f"{sys.executable} -c \"from pathlib import Path; Path('AUTO_BUILD.md').write_text('auto built\\n', encoding='utf-8')\""
+            command = (
+                f"{sys.executable} -c \"import json, os; from pathlib import Path; "
+                "Path(os.environ['BUILD_TASK_DIR'], 'builder-run-metadata.json').write_text(json.dumps({'policy_version': '2026-06-27', 'workflow_role': 'builder', 'required_model_tier': 'coding_working', 'provider': 'openai-api', 'model': 'gpt-5.4'}), encoding='utf-8'); "
+                "Path('AUTO_BUILD.md').write_text('auto built\\n', encoding='utf-8')\""
+            )
             (tmp_path / ".automation" / "builder-config.json").write_text(json.dumps({"enabled": True, "builder_command": command}), encoding="utf-8")
 
             result = auto_builder_runner.auto_run_builder(tmp_path, execute=True)
@@ -868,8 +1076,10 @@ class PlanAutomationTests(unittest.TestCase):
             (task_dir / "meta.json").write_text(json.dumps({
                 "task_id": task_id,
                 "state": "VERIFYING",
+                "commit": "stale-top-level-sha",
+                "build_blocker": {"decision": "BLOCKED", "reason": "stale no-change blocker"},
                 "awaiting_operator": False,
-                "dispatch": {"worktree": str(worktree), "branch": "feat/pre-pr", "base_branch": "main"},
+                "dispatch": {"worktree": str(worktree), "branch": "feat/pre-pr", "base_branch": "main", "readiness_job_id": "stale-job"},
                 "build": {"commit_sha": old_sha, "readiness_job_id": job["job_id"]},
             }), encoding="utf-8")
 
@@ -880,6 +1090,9 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertNotEqual(result["after_sha"], old_sha)
             meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["state"], "VERIFYING")
+            self.assertNotIn("build_blocker", meta)
+            self.assertEqual(meta["commit"], result["after_sha"])
+            self.assertEqual(meta["dispatch"]["readiness_job_id"], result["readiness_job_id"])
             self.assertEqual(meta["build"]["commit_sha"], result["after_sha"])
             self.assertEqual(meta["build"]["readiness_job_id"], result["readiness_job_id"])
             new_job_path = tmp_path / ".automation" / "pr-readiness" / f"{result['readiness_job_id']}.json"
@@ -893,6 +1106,55 @@ class PlanAutomationTests(unittest.TestCase):
             summary = (task_dir / "builder-summary.md").read_text(encoding="utf-8")
             self.assertIn(result["after_sha"], summary)
             self.assertIn(result["readiness_job_id"], summary)
+            task_summary = (task_dir / "summary.md").read_text(encoding="utf-8")
+            task_evidence = (task_dir / "evidence.md").read_text(encoding="utf-8")
+            self.assertIn(result["after_sha"], task_summary)
+            self.assertIn(result["readiness_job_id"], task_summary)
+            self.assertIn(result["after_sha"], task_evidence)
+            self.assertIn(result["readiness_job_id"], task_evidence)
+
+    def test_publish_blocks_when_configured_head_does_not_match_task_branch(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            worktree = tmp_path / "worktree"
+            worktree.mkdir()
+            subprocess.run(["git", "init", "-b", "main"], cwd=worktree, check=True, text=True, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=worktree, check=True)
+            subprocess.run(["git", "config", "user.name", "Test User"], cwd=worktree, check=True)
+            (worktree / "README.md").write_text("# demo\n", encoding="utf-8")
+            subprocess.run(["git", "add", "README.md"], cwd=worktree, check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=worktree, check=True, text=True, capture_output=True)
+            subprocess.run(["git", "checkout", "-b", "fix/uule"], cwd=worktree, check=True, text=True, capture_output=True)
+            sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=worktree, check=True, text=True, capture_output=True).stdout.strip()
+
+            task_id = "task-publish-branch-guard"
+            task_dir = tmp_path / "tasks" / task_id
+            task_dir.mkdir(parents=True)
+            job = create_readiness_job(tmp_path, task_id=task_id, branch="fix/uule", sha=sha)
+            mark_readiness_result(tmp_path, job["job_id"], passed=True, issues=[], evidence={"summary": "ok", "model_policy": readiness_model_policy()})
+            (task_dir / "meta.json").write_text(json.dumps({
+                "task_id": task_id,
+                "state": "PR_READY",
+                "awaiting_operator": False,
+                "dispatch": {"worktree": str(worktree), "branch": "fix/uule", "base_branch": "main"},
+                "build": {"commit_sha": sha, "readiness_job_id": job["job_id"], "changed_files": []},
+            }), encoding="utf-8")
+
+            result = publish_draft_pr.publish_draft_pr(
+                tmp_path,
+                task_id=task_id,
+                execute=True,
+                repo="owner/repo",
+                push_remote="origin",
+                head="dom-armor:decision/pr-b4-empirical-verify",
+            )
+
+            self.assertEqual(result["decision"], "BLOCKED")
+            self.assertIn("head ref", result["reason"])
+            self.assertEqual(result["branch"], "fix/uule")
+            self.assertEqual(result["head"], "dom-armor:decision/pr-b4-empirical-verify")
+            meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertNotIn("github", meta)
 
     def test_readiness_runner_blocks_without_configured_verifier(self):
         with tempfile.TemporaryDirectory() as td:
@@ -949,7 +1211,7 @@ class PlanAutomationTests(unittest.TestCase):
             verifier = tmp_path / "verifier.py"
             verifier.write_text(
                 "import json, os\n"
-                "print(json.dumps({'passed': True, 'issues': [], 'evidence': {'job': os.environ['READINESS_JOB_ID'], 'method': 'test-verifier'}}))\n",
+                "print(json.dumps({'passed': True, 'issues': [], 'evidence': {'job': os.environ['READINESS_JOB_ID'], 'method': 'test-verifier', 'model_policy': {'policy_version': '2026-06-27', 'workflow_role': 'readiness_auditor', 'required_model_tier': 'planning_thinking', 'provider': 'openai-api', 'model': 'gpt-5.5'}}}))\n",
                 encoding="utf-8",
             )
             (tmp_path / ".automation").mkdir(exist_ok=True)
@@ -1041,7 +1303,7 @@ class PlanAutomationTests(unittest.TestCase):
             result = publish_draft_pr.publish_draft_pr(tmp_path, task_id=task_id, execute=False)
 
             self.assertEqual(result["decision"], "BLOCKED")
-            self.assertEqual(result["reason"], "readiness gate blocks draft PR publishing")
+            self.assertEqual(result["reason"], "readiness gate blocks PR publishing")
 
     def test_publish_draft_pr_dry_run_when_readiness_passes_for_current_sha(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1064,7 +1326,7 @@ class PlanAutomationTests(unittest.TestCase):
             task_dir = tmp_path / "tasks" / task_id
             task_dir.mkdir(parents=True)
             job = create_readiness_job(tmp_path, task_id=task_id, branch="feat/demo-publish", sha=sha)
-            mark_readiness_result(tmp_path, job["job_id"], passed=True, issues=[], evidence={"audit": "passed"})
+            mark_readiness_result(tmp_path, job["job_id"], passed=True, issues=[], evidence={"audit": "passed", "model_policy": readiness_model_policy()})
             (task_dir / "meta.json").write_text(json.dumps({
                 "task_id": task_id,
                 "state": "VERIFYING",
@@ -1102,7 +1364,7 @@ class PlanAutomationTests(unittest.TestCase):
             result = auto_publish_runner.auto_publish(tmp_path, execute=True)
 
             self.assertEqual(result["decision"], "BLOCKED")
-            self.assertIn("draft PR publishing is not configured", result["reason"])
+            self.assertIn("PR publishing is not configured", result["reason"])
 
     def test_build_control_autopilot_decomposes_dispatches_and_blocks_on_missing_builder(self):
         with tempfile.TemporaryDirectory() as td:
@@ -1240,9 +1502,9 @@ class PlanAutomationTests(unittest.TestCase):
                 },
                 "task-handed-off": {
                     "task_id": "task-handed-off",
-                    "state": "PR_DRAFT",
+                    "state": "PR_OPEN",
                     "awaiting_operator": False,
-                    "github": {"draft_pr_url": "https://github.example/pr/1"},
+                    "github": {"pr_url": "https://github.example/pr/1"},
                     "pr_packet": {"title": "After handoff", "branch": "feat/after-handoff"},
                 },
             }
@@ -1394,6 +1656,17 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertIn("missing_cleanup_critics", {issue["kind"] for issue in result["issues"]})
             self.assertIn("missing_review_findings", {issue["kind"] for issue in result["issues"]})
 
+    def test_pr_readiness_result_fails_without_model_policy(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            job = create_readiness_job(tmp_path, task_id="task-model-policy", branch="feat/model", sha="abc123")
+            result = mark_readiness_result(tmp_path, job["job_id"], passed=True, issues=[], evidence={"summary": "missing model"})
+            self.assertFalse(result["passed"])
+            self.assertEqual(result["state"], "READINESS_FAILED")
+            self.assertIn("missing_model_policy", {issue["kind"] for issue in result["issues"]})
+            self.assertTrue(readiness_blocks(result, current_sha="abc123"))
+            self.assertEqual(readiness_blocks(result, current_sha="abc123", explain=True)["reason"], "audit_not_passed")
+
     def test_ready_for_rereview_signal_blocks_when_gate_not_passed(self):
         module = load_script_module("pr_ready_for_rereview_script", "pr-ready-for-rereview.py")
         with tempfile.TemporaryDirectory() as td:
@@ -1420,7 +1693,7 @@ class PlanAutomationTests(unittest.TestCase):
             )
 
             self.assertTrue(readiness_blocks(job, current_sha="abc123"))
-            passed = mark_readiness_result(tmp_path, job["job_id"], passed=True, issues=[])
+            passed = mark_readiness_result(tmp_path, job["job_id"], passed=True, issues=[], evidence={"model_policy": readiness_model_policy()})
             self.assertFalse(readiness_blocks(passed, current_sha="abc123"))
             self.assertTrue(readiness_blocks(passed, current_sha="def456"))
             self.assertEqual(readiness_blocks(passed, current_sha="def456", explain=True)["reason"], "stale_sha")
@@ -1772,6 +2045,38 @@ class PlanAutomationTests(unittest.TestCase):
             self.assertTrue(mb4["awaiting_operator"])
             self.assertTrue(mb4["dependencies_cleared"])
             self.assertIn("dependencies cleared", mb4["state_reason"])
+
+
+    def test_reconcile_merged_prs_extracts_number_from_github_pr_url(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp_path = Path(td)
+            task_dir = tmp_path / "tasks" / "task-url-pr"
+            task_dir.mkdir(parents=True)
+            (task_dir / "meta.json").write_text(json.dumps({
+                "task_id": "task-url-pr",
+                "state": "PR_OPEN",
+                "awaiting_operator": False,
+                "pr_packet": {"kind": "decision_required", "packet_id": "decision-pr-b4"},
+                "github": {"pr_url": "https://github.com/armor/armor-swarm/pull/856"},
+            }), encoding="utf-8")
+
+            result = reconcile_merged_prs.reconcile_merged_prs(
+                tmp_path,
+                fetch_pr=lambda n, repo: {
+                    "number": n,
+                    "state": "MERGED",
+                    "url": f"https://github.com/armor/armor-swarm/pull/{n}",
+                    "mergedAt": "2026-06-27T13:42:15Z",
+                    "headRefOid": "sha856",
+                    "baseRefName": "main",
+                },
+            )
+
+            self.assertEqual(result["merged_count"], 1)
+            meta = json.loads((task_dir / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["state"], "DONE")
+            self.assertEqual(meta["github"]["pr_number"], 856)
+            self.assertEqual(meta["github"]["merged_at"], "2026-06-27T13:42:15Z")
 
     def test_reconcile_merged_prs_leaves_open_pr_task_waiting(self):
         with tempfile.TemporaryDirectory() as td:

@@ -144,6 +144,43 @@ def mark_decision_task_ready(task_dir: Path, meta: dict[str, Any], now: str, *, 
     return action
 
 
+def normalize_builder_ready_task(task_dir: Path, meta: dict[str, Any], now: str, *, dry_run: bool = False) -> dict[str, Any] | None:
+    """Repair stale ESCALATED task state after operator/readiness reconciliation.
+
+    Root cause: parent progress and auto-builder selection can disagree when a
+    child is no longer awaiting the operator and its execute phase is builder-ready
+    but the top-level state still says ESCALATED. Normalize the source state so
+    the next autopilot tick can execute the task instead of posting a stale
+    operator-input alert.
+    """
+    state = str(meta.get("state") or "")
+    phase_raw = meta.get("phase_status")
+    phase: dict[str, Any] = phase_raw if isinstance(phase_raw, dict) else {}
+    dispatch_raw = meta.get("dispatch")
+    dispatch: dict[str, Any] = dispatch_raw if isinstance(dispatch_raw, dict) else {}
+    if state != "ESCALATED":
+        return None
+    if meta.get("awaiting_operator"):
+        return None
+    if phase.get("EXECUTE") != "READY_FOR_BUILDER":
+        return None
+    if not dispatch.get("worktree"):
+        return None
+    action = {
+        "action": "would_normalize_builder_ready_task" if dry_run else "normalized_builder_ready_task",
+        "task_id": meta.get("task_id") or task_dir.name,
+        "from_state": state,
+        "to_state": "READY_FOR_BUILDER",
+    }
+    if not dry_run:
+        meta["state"] = "READY_FOR_BUILDER"
+        meta["awaiting_operator"] = False
+        meta["state_reason"] = "operator/readiness reconciliation complete; ready for builder execution"
+        meta["updated_at"] = now
+        write_json(task_dir / "meta.json", meta)
+    return action
+
+
 def child_owner(meta: dict[str, Any]) -> str:
     state = str(meta.get("state") or "UNKNOWN")
     if state in {"DONE", "CANCELLED", "parked"}:
@@ -268,6 +305,9 @@ def reconcile_plan_progress(repo_root: Path, *, dry_run: bool = False) -> dict[s
     for children in by_plan.values():
         for task_dir, meta in children:
             action = mark_decision_task_ready(task_dir, meta, now, dry_run=dry_run)
+            if action:
+                actions.append(action)
+            action = normalize_builder_ready_task(task_dir, meta, now, dry_run=dry_run)
             if action:
                 actions.append(action)
 

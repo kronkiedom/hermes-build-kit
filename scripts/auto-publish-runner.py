@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Automatically publish readiness-passed built tasks as draft PRs when configured.
+"""Automatically publish readiness-passed built tasks as ready-for-review PRs when configured.
 
 Fail-closed: without .automation/publish-config.json enabled=true, this records a
 BLOCKED status rather than pushing/opening a PR. This makes the source of truth
@@ -54,7 +54,7 @@ def eligible_built_task(repo_root: Path) -> tuple[Path, dict[str, Any]] | None:
 def auto_publish(repo_root: Path, *, execute: bool = False) -> dict[str, Any]:
     selected = eligible_built_task(repo_root)
     if not selected:
-        return {"kind": "AUTO-PUBLISH", "decision": "IDLE", "reason": "no built task with readiness evidence is eligible for draft PR publishing"}
+        return {"kind": "AUTO-PUBLISH", "decision": "IDLE", "reason": "no built task with readiness evidence is eligible for PR publishing"}
     task_dir, meta = selected
     task_id = str(meta.get("task_id") or task_dir.name)
     cfg = publish_config(repo_root)
@@ -63,7 +63,7 @@ def auto_publish(repo_root: Path, *, execute: bool = False) -> dict[str, Any]:
             "kind": "AUTO-PUBLISH",
             "decision": "BLOCKED",
             "task_id": task_id,
-            "reason": "draft PR publishing is not configured; set .automation/publish-config.json enabled=true with repo/push_remote/head as needed",
+            "reason": "PR publishing is not configured; set .automation/publish-config.json enabled=true with repo/push_remote/head as needed",
         }
     publisher = load_publish_draft_pr()
     return publisher.publish_draft_pr(

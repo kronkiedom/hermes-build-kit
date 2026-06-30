@@ -19,7 +19,7 @@ from plan_automation_lib import read_json, utc_now, write_json
 from pr_readiness_lib import load_readiness_job, mark_readiness_result
 
 ELIGIBLE_STATES = {"VERIFYING", "PR_READY"}
-TERMINAL_STATES = {"DONE", "CANCELLED", "SUPERSEDED", "PR_DRAFT"}
+TERMINAL_STATES = {"DONE", "CANCELLED", "SUPERSEDED", "PR_DRAFT", "PR_OPEN"}
 
 
 def run(cmd: list[str], *, cwd: Path, env: dict[str, str] | None = None, timeout: int = 1800) -> dict[str, Any]:
@@ -169,6 +169,23 @@ def run_readiness(repo_root: Path, *, execute: bool = False, task_id: str | None
     if not execute:
         return {"kind": "READINESS-RUNNER", "decision": "WOULD_RUN", "task_id": selected_task_id, "job_id": job.get("job_id"), "verifier_configured": True}
 
+    # --- Deterministic CI-parity gate (mirrors .github/workflows/validate.yml "Code checks").
+    # Fail-closed BEFORE the LLM verifier: the auditor only runs targeted tests for changed
+    # surfaces and misses cross-cutting / full-suite failures that GitHub CI enforces. ---
+    gate_script = Path.home() / ".hermes" / "scripts" / "bk-ci-parity-gate.sh"
+    if gate_script.exists():
+        gate_env = os.environ.copy()
+        gate_env["PATH"] = f"{Path.home() / '.local' / 'bin'}:" + gate_env.get("PATH", "")
+        gate = run(["bash", str(gate_script)], cwd=worktree, env=gate_env, timeout=timeout_seconds)
+        gate_output_path = task_dir / "ci-parity-gate-output.txt"
+        gate_output_path.write_text(str(gate.get("stdout") or "") + str(gate.get("stderr") or ""), encoding="utf-8")
+        if gate.get("returncode") != 0:
+            issue = {"kind": "ci_parity_gate_failed", "severity": "P1", "message": "Deterministic CI-parity gate failed (tsc baseline / guard scripts / esbuild bundle parity / curated test suites) -- exactly what GitHub CI enforces; fix before PR.", "evidence": str(gate_output_path)}
+            marked = mark_readiness_result(repo_root, str(job["job_id"]), passed=False, issues=[issue], evidence={"ci_parity_gate_output": str(gate_output_path)})
+            write_readiness_feedback(task_dir, marked)
+            update_task(task_dir, meta, {"state": "READY_FOR_BUILDER", "phase_status": {**dict_or_empty(meta.get("phase_status")), "VERIFY": "FAILED", "EXECUTE": "READY_FOR_BUILDER"}, "awaiting_operator": False, "state_reason": "CI-parity gate failed; builder must fix the failing CI checks before PR"})
+            return {"kind": "READINESS-RUNNER", "decision": "CI_PARITY_FAILED", "task_id": selected_task_id, "job_id": job.get("job_id"), "ci_parity_gate_output": str(gate_output_path)}
+
     env = os.environ.copy()
     env.update({
         "READINESS_JOB_ID": str(job.get("job_id") or ""),
@@ -205,7 +222,7 @@ def run_readiness(repo_root: Path, *, execute: bool = False, task_id: str | None
             "state": "PR_READY",
             "phase_status": {**dict_or_empty(meta.get("phase_status")), "VERIFY": "PASSED"},
             "awaiting_operator": False,
-            "state_reason": "readiness audit passed for current SHA; draft PR publishing may proceed",
+            "state_reason": "readiness audit passed for current SHA; PR publishing may proceed",
         })
         decision = "PR_READY"
     else:

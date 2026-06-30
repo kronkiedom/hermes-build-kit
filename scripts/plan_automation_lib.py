@@ -69,6 +69,50 @@ def write_text(path: Path, content: str) -> None:
     tmp.replace(path)
 
 
+def write_task_readiness_artifacts(
+    task_dir: Path,
+    *,
+    task_id: str,
+    worktree: Path,
+    commit_sha: str,
+    readiness_job_id: str,
+    changed_files: list[str],
+    state_reason: str,
+    note: str,
+) -> None:
+    """Refresh packet evidence docs for the exact SHA queued for readiness."""
+    # Root cause: readiness gates re-read task evidence, so queuing a new SHA is
+    # INVALID-WITHOUT matching summary/evidence docs and metadata.
+    files = "\n".join(f"- `{path}`" for path in changed_files) or "- **None recorded.**"
+    write_text(
+        task_dir / "summary.md",
+        (
+            f"# Summary — {task_id}\n\n"
+            f"Status: readiness queued for commit `{commit_sha}` and job `{readiness_job_id}`.\n\n"
+            f"State reason: {state_reason}\n\n"
+            f"Worktree: `{worktree}`\n\n"
+            f"Note: {note}\n\n"
+            "## Changed files\n\n"
+            f"{files}\n"
+        ),
+    )
+    write_text(
+        task_dir / "evidence.md",
+        (
+            f"# Evidence — {task_id}\n\n"
+            f"- Current readiness SHA: `{commit_sha}`\n"
+            f"- Current readiness job: `{readiness_job_id}`\n"
+            f"- Worktree: `{worktree}`\n"
+            f"- Metadata contract: `meta.commit`, `meta.build.commit_sha`, "
+            f"`meta.dispatch.readiness_job_id`, and `meta.build.readiness_job_id` "
+            f"must all describe this readiness packet.\n"
+            f"- Note: {note}\n\n"
+            "## Changed files\n\n"
+            f"{files}\n"
+        ),
+    )
+
+
 def update_plan_index(repo_root: Path, plan_id: str, entry: dict[str, Any]) -> None:
     index_path = repo_root / ".automation" / "plans-index.json"
     index = read_json(index_path, {"plans": {}})
@@ -274,7 +318,7 @@ def shape_contract(repo_root: Path, plan_id: str, auto_approve: bool = False) ->
         contract.extend([
             "- Implement only the behavior requested by the source plan.",
             "- Preserve existing behavior unless the source plan explicitly requires changing it.",
-            "- Produce at least one draft PR with tests or documented verification evidence.",
+            "- Produce at least one ready-for-review PR with tests or documented verification evidence.",
         ])
     else:
         contract.extend(["- BLOCKED: acceptance criteria need operator clarification before execution."])
@@ -641,7 +685,7 @@ def build_ingest_5x5_audit(markdown: str, request: SourcePlanIngestRequest, stat
     check("Repo/base", "R2", "base branch is named", bool(request.base_branch.strip()), f"base_branch={request.base_branch!r}")
     check("Repo/base", "R3", "dispatch is opt-in", True, f"dispatch={request.dispatch} execute_dispatch={request.execute_dispatch}")
     check("Repo/base", "R4", "worktree root is scoped under automation by default", bool(request.worktree_root.strip()), f"worktree_root={request.worktree_root}")
-    check("Repo/base", "R5", "draft PR creation is not part of ingestion", True, "publish-draft-pr.py remains the SHA-gated publisher")
+    check("Repo/base", "R5", "PR creation is not part of ingestion", True, "publish-draft-pr.py remains the SHA-gated publisher")
 
     check("5x5/process", "P1", "five audit domains are evaluated", True, "domains=Source status, Scope/contract, Repo/base, 5x5/process, Dispatch/PR")
     check("5x5/process", "P2", "five checks per domain are evaluated", True, "25 deterministic checks")
@@ -1017,7 +1061,7 @@ def decompose_plan(repo_root: Path, plan_id: str) -> dict[str, Any]:
             task_md += "- Operator answers the decision prompt in this task's dedicated thread.\n- Build remains blocked until a durable decision is recorded.\n"
             write_text(task_dir / "questions.md", f"# Decision needed\n\n{(packet.get('discord') or {}).get('prompt', packet['title'])}\n")
         else:
-            task_md += "- Implement this packet only.\n- Open a draft PR or record why PR creation is blocked.\n- Persist summary, verification, and evidence artifacts.\n"
+            task_md += "- Implement this packet only.\n- Open a ready-for-review PR or record why PR creation is blocked.\n- Persist summary, verification, and evidence artifacts.\n"
         write_json(task_dir / "meta.json", task_meta)
         write_text(task_dir / "task.md", task_md)
         write_text(task_dir / "checkpoints.md", f"# checkpoints\n\n- {now} — created from plan decomposition `{plan_id}` ({kind})\n")

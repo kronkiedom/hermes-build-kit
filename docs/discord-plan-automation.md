@@ -119,9 +119,9 @@ The intake/contract/decomposition layers are implemented. Execution is now split
 1. `scripts/dispatch-pr-worker.py` selects one eligible task packet, validates that the target repo is a concrete local git checkout, prepares an isolated git worktree/branch, writes `builder-prompt.md`, `summary.md`, and `evidence.md`, and queues an initial SHA-scoped PR-readiness gate for the base dispatch SHA.
 2. `scripts/run-builder-worker.py` consumes the dispatched packet, runs an operator/configured builder command inside the isolated worktree, records command output and build evidence, commits produced changes, and queues the SHA-scoped PR-readiness gate for the new commit.
 
-3. `scripts/publish-draft-pr.py` publishes a draft GitHub PR only after the task's recorded readiness job passes for the worktree's current HEAD SHA. Without `--execute`, it dry-runs and reports `WOULD_PUBLISH`.
+3. `scripts/publish-draft-pr.py` publishes a ready-for-review GitHub PR only after the task's recorded readiness job passes for the worktree's current HEAD SHA. Without `--execute`, it dry-runs and reports `WOULD_PUBLISH`.
 
-The workers do **not** invent code changes by themselves and do not create empty PRs. Draft PR creation happens only after a builder command has produced commits and the readiness gate passes for that exact commit.
+The workers do **not** invent code changes by themselves and do not create empty PRs. PR creation happens only after a builder command has produced commits and the readiness gate passes for that exact commit.
 
 For a safe dispatch dry run:
 
@@ -153,13 +153,13 @@ The builder command receives these environment variables:
 
 If no command is passed, the worker reads `HERMES_BUILDER_COMMAND`.
 
-To dry-run draft PR publishing after readiness passes:
+To dry-run PR publishing after readiness passes:
 
 ```bash
 python3 scripts/publish-draft-pr.py --task-id <task-id>
 ```
 
-To actually push the task branch and create the draft PR:
+To actually push the task branch and create the ready-for-review PR:
 
 ```bash
 python3 scripts/publish-draft-pr.py --task-id <task-id> --execute
@@ -181,7 +181,7 @@ Because the PR status monitor intentionally searches only open PRs, `scripts/rec
 
 `DISPATCHED`/`READY_FOR_BUILDER` means the worktree and `builder-prompt.md` exist; it does **not** mean a builder process is running. `scripts/auto-builder-runner.py` is the automatic bridge from approval/dispatch to actual builder execution: it scans ready tasks and runs `scripts/run-builder-worker.py` only when `.automation/builder-config.json` has `enabled=true` plus `builder_command` (or `HERMES_BUILDER_COMMAND` is set). Without that command it fails closed and leaves the card at `READY_FOR_BUILDER`.
 
-`scripts/build-control-autopilot.py` is the top-level deterministic loop for the desired Discord workflow: initial contract approval grants scoped build/draft-PR authority for that plan, then the autopilot decomposes, dispatches, runs the configured builder, publishes readiness-passed draft PRs when publish config allows, and keeps reconciling parent status. It stops only for concrete decisions, missing configuration, readiness failures, or PR-status handoff. The cron wrapper is `bk-build-control-autopilot.sh`.
+`scripts/build-control-autopilot.py` is the top-level deterministic loop for the desired Discord workflow: initial contract approval grants scoped build/PR authority for that plan, then the autopilot decomposes, dispatches, runs the configured builder, publishes readiness-passed PRs when publish config allows, and keeps reconciling parent status. It stops only for concrete decisions, missing configuration, readiness failures, or PR-status handoff. The cron wrapper is `bk-build-control-autopilot.sh`.
 
 ## Open plan router and thread replies
 

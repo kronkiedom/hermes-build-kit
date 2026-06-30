@@ -40,7 +40,15 @@ ISSUE_SEVERITY = {
     "awaiting_re_review": 2,
     "stacked_base_blocked": 1,
 }
-NON_PING_ISSUE_KINDS = {"awaiting_re_review", "stacked_base_blocked"}
+NON_PING_ISSUE_KINDS = {"awaiting_re_review", "stacked_base_blocked", "intentional_hold", "held_rebase_deferred", "held_action_deferred"}
+HOLD_PHRASES = (
+    "holding, not merging",
+    "holding not merging",
+    "review-gated",
+    "architecture-gated",
+    "intentional hold",
+    "on hold",
+)
 ACTIVE_ALERT_STATES = {"ACTION_PENDING", "ACTION_IN_PROGRESS", "FIX_PUSHED_WAITING_CI_OR_REVIEW"}
 
 
@@ -123,6 +131,14 @@ def _latest_review_by_user(reviews: list[dict[str, Any]]) -> dict[str, dict[str,
     return latest
 
 
+def _comment_is_intentional_hold(comment: dict[str, Any], operator_login: str) -> bool:
+    user = _actor_login(comment.get("user"))
+    if str(user) == operator_login:
+        return False
+    body = str(comment.get("body") or "").lower()
+    return any(phrase in body for phrase in HOLD_PHRASES)
+
+
 def _comment_is_actionable(comment: dict[str, Any], operator_login: str) -> bool:
     user = _actor_login(comment.get("user"))
     if str(user) == operator_login:
@@ -167,13 +183,32 @@ def _comment_after(comment: dict[str, Any], cutoff: datetime | None) -> bool:
 def classify_pr(pr: dict[str, Any], *, operator_login: str) -> dict[str, Any]:
     """Classify one PR for the operator status channel."""
     issues: list[dict[str, Any]] = []
+    issue_comments = pr.get("issue_comments", [])
+    hold_comments = [comment for comment in issue_comments if _comment_is_intentional_hold(comment, operator_login)]
+    held_by_reviewer = bool(hold_comments)
+    if held_by_reviewer:
+        latest_hold = hold_comments[-1]
+        issues.append({
+            "kind": "intentional_hold",
+            "summary": f"reviewer placed an intentional hold: {str(latest_hold.get('body') or '')[:120]}",
+            "url": latest_hold.get("html_url"),
+            "autocure": "none_wait_for_reviewer_or_operator_direction",
+        })
+
     mergeable_state = str(pr.get("mergeable_state") or "").lower()
     if mergeable_state in {"dirty", "behind"}:
-        issues.append({
-            "kind": "rebase_required",
-            "summary": f"branch merge state is `{mergeable_state}`; rebase/update before review can clear",
-            "autocure": "rebase_supported_with_operator_authorization",
-        })
+        if held_by_reviewer:
+            issues.append({
+                "kind": "held_rebase_deferred",
+                "summary": f"branch merge state is `{mergeable_state}`, but reviewer explicitly put the PR on hold; do not keep pinging for rebase",
+                "autocure": "none_wait_until_hold_lifts",
+            })
+        else:
+            issues.append({
+                "kind": "rebase_required",
+                "summary": f"branch merge state is `{mergeable_state}`; rebase/update before review can clear",
+                "autocure": "rebase_supported_with_operator_authorization",
+            })
 
     for reviewer, review in _latest_review_by_user(pr.get("reviews", [])).items():
         state = str(review.get("state") or "").upper()
@@ -202,32 +237,57 @@ def classify_pr(pr: dict[str, Any], *, operator_login: str) -> dict[str, Any]:
         status = str(run.get("status") or "").lower()
         conclusion = str(run.get("conclusion") or "").lower()
         if status == "completed" and conclusion in {"failure", "timed_out", "cancelled", "action_required"}:
-            issues.append({
-                "kind": "check_failed",
-                "summary": f"check `{run.get('name')}` concluded `{conclusion}`",
-                "url": run.get("html_url"),
-                "autocure": "ci_log_diagnosis_supported",
-            })
+            if held_by_reviewer:
+                issues.append({
+                    "kind": "held_action_deferred",
+                    "summary": f"check `{run.get('name')}` concluded `{conclusion}`, but PR is intentionally held",
+                    "url": run.get("html_url"),
+                    "autocure": "none_wait_until_hold_lifts",
+                })
+            else:
+                issues.append({
+                    "kind": "check_failed",
+                    "summary": f"check `{run.get('name')}` concluded `{conclusion}`",
+                    "url": run.get("html_url"),
+                    "autocure": "ci_log_diagnosis_supported",
+                })
 
     for comment in pr.get("review_comments", []):
         if _comment_is_actionable(comment, operator_login):
-            issues.append({
-                "kind": "review_comment",
-                "summary": f"review comment by {_actor_login(comment.get('user'))}: {str(comment.get('body') or '')[:120]}",
-                "url": comment.get("html_url"),
-                "autocure": "manual_or_targeted_fix",
-            })
+            if held_by_reviewer:
+                issues.append({
+                    "kind": "held_action_deferred",
+                    "summary": f"review comment by {_actor_login(comment.get('user'))} is deferred while PR is intentionally held",
+                    "url": comment.get("html_url"),
+                    "autocure": "none_wait_until_hold_lifts",
+                })
+            else:
+                issues.append({
+                    "kind": "review_comment",
+                    "summary": f"review comment by {_actor_login(comment.get('user'))}: {str(comment.get('body') or '')[:120]}",
+                    "url": comment.get("html_url"),
+                    "autocure": "manual_or_targeted_fix",
+                })
 
-    issue_comments = pr.get("issue_comments", [])
     latest_operator_reply = _latest_operator_issue_comment_time(issue_comments, operator_login)
     for comment in issue_comments:
+        if _comment_is_intentional_hold(comment, operator_login):
+            continue
         if _comment_after(comment, latest_operator_reply) and _comment_is_actionable(comment, operator_login):
-            issues.append({
-                "kind": "issue_comment",
-                "summary": f"PR comment by {_actor_login(comment.get('user'))}: {str(comment.get('body') or '')[:120]}",
-                "url": comment.get("html_url"),
-                "autocure": "manual_triage",
-            })
+            if held_by_reviewer:
+                issues.append({
+                    "kind": "held_action_deferred",
+                    "summary": f"PR comment by {_actor_login(comment.get('user'))} is deferred while PR is intentionally held",
+                    "url": comment.get("html_url"),
+                    "autocure": "none_wait_until_hold_lifts",
+                })
+            else:
+                issues.append({
+                    "kind": "issue_comment",
+                    "summary": f"PR comment by {_actor_login(comment.get('user'))}: {str(comment.get('body') or '')[:120]}",
+                    "url": comment.get("html_url"),
+                    "autocure": "manual_triage",
+                })
 
     issues.sort(key=lambda issue: (-ISSUE_SEVERITY.get(issue["kind"], 0), issue.get("summary", "")))
     pr_id = f"{pr.get('owner')}/{pr.get('repo')}#{pr.get('number')}"
@@ -455,8 +515,13 @@ def sync_discord_status_channel(
         if dry_run:
             actions.append({"action": "would_upsert_message", "pr": pr_key, "state": status["state"]})
         elif entry.get("message_id"):
-            edit_message(token, channel_id, entry["message_id"], content)
-            actions.append({"action": "updated_message", "pr": pr_key})
+            try:
+                edit_message(token, channel_id, entry["message_id"], content)
+                actions.append({"action": "updated_message", "pr": pr_key})
+            except Exception as exc:
+                # Root cause: Discord rejects repeated edits to older status messages;
+                # status-card edit failure must not abort alert suppression or thread closure.
+                actions.append({"action": "update_message_failed", "pr": pr_key, "error": str(exc)})
         else:
             entry["message_id"] = post_message(token, channel_id, content)
             actions.append({"action": "created_message", "pr": pr_key})
@@ -547,12 +612,18 @@ def sync_discord_status_channel(
             actions.append({"action": "would_mark_merged_and_close_thread", "pr": pr_key, "thread_id": entry.get("thread_id")})
         else:
             if entry.get("message_id"):
-                edit_message(token, channel_id, entry["message_id"], format_merged_status_message(pr_key, merge_state))
-                actions.append({"action": "updated_message_merged", "pr": pr_key})
+                try:
+                    edit_message(token, channel_id, entry["message_id"], format_merged_status_message(pr_key, merge_state))
+                    actions.append({"action": "updated_message_merged", "pr": pr_key})
+                except Exception as exc:
+                    actions.append({"action": "update_message_merged_failed", "pr": pr_key, "error": str(exc)})
             if entry.get("thread_id") and not entry.get("thread_archived_at"):
-                archive_thread(token, entry["thread_id"])
-                entry["thread_archived_at"] = utc_now()
-                actions.append({"action": "archived_thread_after_merge", "pr": pr_key, "thread_id": entry.get("thread_id")})
+                try:
+                    archive_thread(token, entry["thread_id"])
+                    entry["thread_archived_at"] = utc_now()
+                    actions.append({"action": "archived_thread_after_merge", "pr": pr_key, "thread_id": entry.get("thread_id")})
+                except Exception as exc:
+                    actions.append({"action": "archive_thread_after_merge_failed", "pr": pr_key, "thread_id": entry.get("thread_id"), "error": str(exc)})
         active = entry.get("active_alert") if isinstance(entry.get("active_alert"), dict) else None
         if active:
             active["state"] = "RESOLVED"

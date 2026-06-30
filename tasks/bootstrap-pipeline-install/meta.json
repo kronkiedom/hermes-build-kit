@@ -1,25 +1,28 @@
 {
-  "task_id": "bootstrap-pipeline-install",
+  "awaiting_operator": false,
+  "completed_at": "2026-06-25T16:20:58.828277+00:00",
   "created": "2026-06-24T01:26:41.664157+00:00",
-  "state": "VERIFY-LOOP",
-  "phase_status": {
-    "SHAPE": "COMPLETED",
-    "CONTRACT-CHECKPOINT": "COMPLETED",
-    "VERIFY-LOOP": "PROCESSING"
-  },
   "draft_rounds": 0,
-  "verify_reengage": 0,
+  "escalations": [],
+  "last_completed_step": "EVIDENCE",
   "operator_approvals": [
     {
-      "phase": "CONTRACT-CHECKPOINT",
+      "artifact": "tasks/bootstrap-pipeline-install/task.md",
       "outcome": "APPROVE",
-      "timestamp": "2026-06-24T16:28:06.549399+00:00",
+      "phase": "CONTRACT-CHECKPOINT",
       "source": "discord/local operator message: approve",
-      "artifact": "tasks/bootstrap-pipeline-install/task.md"
+      "timestamp": "2026-06-24T16:28:06.549399+00:00"
     }
   ],
-  "escalations": [],
-  "last_completed_step": "CONTRACT-CHECKPOINT",
-  "awaiting_operator": false,
-  "state_reason": "operator approved checkpoint; implementation complete and in verification"
+  "phase_status": {
+    "CONTRACT-CHECKPOINT": "COMPLETED",
+    "EVIDENCE": "COMPLETED",
+    "SHAPE": "COMPLETED",
+    "VERIFY-LOOP": "COMPLETED"
+  },
+  "state": "DONE",
+  "state_reason": "bootstrap pipeline self-install verified with durable local evidence; runtime artifacts are ignored and not intended for GitHub source commits",
+  "task_id": "bootstrap-pipeline-install",
+  "updated_at": "2026-06-25T16:20:58.828277+00:00",
+  "verify_reengage": 0
 }

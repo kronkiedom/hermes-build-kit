@@ -73,7 +73,7 @@ def active_execution_tasks(repo_root: Path) -> list[dict[str, Any]]:
     active = []
     for meta_path in task_meta_paths(repo_root):
         meta = read_json(meta_path, {})
-        if meta.get("state") in ACTIVE_EXECUTION_STATES and not meta.get("awaiting_operator"):
+        if meta.get("state") in ACTIVE_EXECUTION_STATES and not meta.get("awaiting_operator") and not meta.get("dispatch", {}).get("pr_created", False):
             active.append({"task_id": meta.get("task_id", meta_path.parent.name), "state": meta.get("state"), "task_dir": str(meta_path.parent)})
     return active
 
@@ -111,7 +111,7 @@ Worktree: `{repo_path}`
 ## Rules
 - Implement this packet only.
 - Do not merge.
-- Create a draft PR only after code changes and local verification exist.
+- Create a ready-for-review PR only after code changes and local verification exist.
 - Write `summary.md`, `evidence.md`, and verification output before claiming ready.
 - Run the SHA-scoped PR readiness gate before ready-for-review.
 
@@ -156,7 +156,7 @@ def dispatch_one(repo_root: Path, *, task_id: str | None = None, execute: bool =
         return {
             "kind": "PR-DISPATCH",
             "decision": "BLOCKED",
-            "reason": "draft PR creation is intentionally gated until a builder has produced commits and verification evidence",
+            "reason": "PR creation is intentionally gated until a builder has produced commits and verification evidence",
             "required": "Run dispatch without --create-draft-pr, complete builder work, then use a separate PR publishing step after readiness evidence exists.",
         }
     active = active_execution_tasks(repo_root)
@@ -224,7 +224,7 @@ def dispatch_one(repo_root: Path, *, task_id: str | None = None, execute: bool =
             "base_branch": base_branch,
             "repo_path": str(local_repo),
             "readiness_job_id": readiness["job_id"],
-            "draft_pr_created": False,
+            "pr_created": False,
         },
     })
     event = {"kind": "PR-DISPATCH", "decision": "DISPATCHED", "task_id": selected_task_id, "worktree": str(worktree), "branch": branch, "readiness_job_id": readiness["job_id"], "timestamp": utc_now()}
@@ -236,7 +236,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task-id", default=None)
     parser.add_argument("--execute", action="store_true", help="Mutate task state and prepare the worktree. Without this, dry-runs only.")
-    parser.add_argument("--create-draft-pr", action="store_true", help="Reserved for future builder completion; dispatch does not create empty PRs.")
+    parser.add_argument("--create-draft-pr", action="store_true", help="Deprecated compatibility flag; dispatch does not create empty PRs.")
     parser.add_argument("--worktree-root", default=".automation/pr-worktrees")
     args = parser.parse_args()
     payload = dispatch_one(Path.cwd(), task_id=args.task_id, execute=args.execute, create_draft_pr=args.create_draft_pr, worktree_root=args.worktree_root)

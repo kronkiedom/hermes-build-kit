@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import Any, Callable
@@ -59,11 +60,18 @@ def packet_id(meta: dict[str, Any]) -> str:
 
 def packet_pr_number(meta: dict[str, Any]) -> int | None:
     packet = task_packet(meta)
-    raw = packet.get("pr_number")
+    github = task_github(meta)
+    raw = packet.get("pr_number") or github.get("pr_number")
     if isinstance(raw, int):
         return raw
     if isinstance(raw, str) and raw.isdigit():
         return int(raw)
+    pr_url = str(github.get("pr_url") or github.get("draft_pr_url") or "")
+    match = re.search(r"/pull/(\d+)(?:\b|$)", pr_url)
+    if match:
+        # Root cause: PR-status handoff tasks may only store github.pr_url, so
+        # merged-PR reconciliation must recover the PR number from that URL.
+        return int(match.group(1))
     return None
 
 
